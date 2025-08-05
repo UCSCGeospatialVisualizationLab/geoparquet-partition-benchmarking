@@ -1,0 +1,76 @@
+version: '3.8'
+
+services:
+  parquet-perf-test:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: parquet-performance-test
+    
+    # Resource limits - 4 cores, 8GB RAM
+    deploy:
+      resources:
+        limits:
+          cpus: '4.0'
+          memory: 8G
+        reservations:
+          cpus: '2.0'
+          memory: 4G
+    
+    # Environment variables
+    environment:
+      - AWS_PROFILE=default
+      - PYTHONPATH=/app
+      - NODE_ENV=development
+      - DUCKDB_ENABLE_HTTPFS=1
+    
+    # Volume mounts
+    volumes:
+      - ..:/app
+      - ~/.aws:/home/testuser/.aws:ro  # AWS credentials (read-only)
+      - parquet-results:/app/results
+      - parquet-cache:/tmp/cache
+    
+    # Port mappings
+    ports:
+      - "3000:3000"    # Visualization server
+      - "8080:8080"    # Analytics API
+      - "8888:8888"    # Jupyter notebook
+    
+    # Network configuration for monitoring
+    networks:
+      - perf-test-network
+    
+    # Keep container running
+    stdin_open: true
+    tty: true
+    
+    # Health check
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # Network monitoring sidecar (optional)
+  network-monitor:
+    image: nicolaka/netshoot
+    container_name: network-monitor
+    network_mode: "container:parquet-perf-test"
+    command: sleep infinity
+    profiles:
+      - monitoring
+
+networks:
+  perf-test-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+
+volumes:
+  parquet-results:
+    driver: local
+  parquet-cache:
+    driver: local

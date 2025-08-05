@@ -1,0 +1,101 @@
+# S3 Configuration for Parquet Performance Testing
+
+# Source data configuration
+source:
+  bucket: "vizlab-geodatalake"
+  prefix: "hazus/vector/"
+  file: "hazus_CensusTract.parquet"
+  url: "s3://vizlab-geodatalake/hazus/vector/hazus_CensusTract.parquet"
+  estimated_size_gb: 1.6
+
+# Test data bucket configuration (using same bucket as source)
+test_bucket:
+  bucket: "vizlab-geodatalake"
+  prefix: "hazus-performance-test/"
+
+# Partitioning strategies configuration
+partitioning_strategies:
+  no_partition:
+    path: "no_partition/"
+    description: "Single file, no partitioning (control case)"
+    target_file_size_mb: 160 
+    
+  spatial_h3_l6:
+    path: "spatial_h3_l6/"
+    description: "Pure spatial grid using H3 level 6 hexagons"
+    target_file_size_mb: 5
+    h3_level: 6
+    partition_column: "h3_level6"
+    
+  attribute_state:
+    path: "attribute_state/"
+    description: "Attribute-based partitioning by StateAbbr"
+    target_file_size_mb: 3
+    partition_column: "StateAbbr"
+    
+  hybrid_state_h3:
+    path: "hybrid_state_h3/"
+    description: "Hybrid: StateAbbr then H3 sub-partitions"
+    target_file_size_mb: 8
+    partition_columns: ["StateAbbr", "h3_level6"]
+    h3_level: 6
+
+# HTTP access configuration
+http_config:
+  cors_enabled: true
+  cache_control: "public, max-age=3600"
+  content_type: "application/octet-stream"
+  range_requests: true
+  
+# Performance testing configuration
+performance_config:
+  # Number of test runs for statistical significance
+  test_runs: 5
+  
+  # Network conditions to simulate
+  network_conditions:
+    high_bandwidth:
+      description: "Data center / high-speed connection"
+      bandwidth_mbps: 1000
+      latency_ms: 10
+      
+    medium_bandwidth:
+      description: "Office / broadband connection"
+      bandwidth_mbps: 100
+      latency_ms: 50
+      
+    low_bandwidth:
+      description: "Mobile / constrained connection"
+      bandwidth_mbps: 10
+      latency_ms: 200
+
+# Query configurations
+analytical_queries:
+  point_in_polygon:
+    description: "Find tracts containing specific coordinates"
+    test_points:
+      - [-122.4, 37.8]  # San Francisco
+      - [-74.0, 40.7]   # New York
+      - [-87.6, 41.9]   # Chicago
+      
+  attribute_aggregation:
+    description: "Sum population by state/region"
+    groupby_columns: ["state_code"]
+    aggregate_columns: ["population", "households"]
+    
+  spatial_range:
+    description: "Tracts within bounding box"
+    test_bboxes:
+      - [-124, 32, -114, 42]  # California
+      - [-84, 24, -80, 31]    # Florida
+      - [-75, 40, -73, 41]    # NYC area
+      
+  spatial_join:
+    description: "Tracts intersecting with hazard zones"
+    # Will require additional hazard zone dataset
+    
+  complex_analytics:
+    description: "Multi-condition filter + aggregation + spatial"
+    conditions:
+      - "population > 1000"
+      - "state_code IN ('CA', 'NY', 'TX')"

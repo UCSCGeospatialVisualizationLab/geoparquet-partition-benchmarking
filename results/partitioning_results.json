@@ -1,0 +1,14 @@
+{
+  "timestamp": "2025-08-05 12:38:32",
+  "total_strategies": 1,
+  "results": [
+    {
+      "strategy": "no_partition",
+      "files_created": 1,
+      "target_path": "s3://vizlab-geodatalake/hazus-performance-test/no_partition/hazus_CensusTract.parquet",
+      "duration_seconds": 91.10287094116211
+    }
+  ],
+  "total_duration": 91.10287094116211,
+  "total_files_created": 1
+}
