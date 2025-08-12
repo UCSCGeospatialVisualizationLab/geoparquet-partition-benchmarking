@@ -197,6 +197,430 @@ async function simulateHyparquetStreaming(url, options = {}) {
 }
 
 /**
+ * Compute a simple axis-aligned bounding box for common WKB geometry types
+ * Supported: Point(1), LineString(2), Polygon(3), MultiPolygon(6)
+ */
+function wkbEnvelope(wkbUint8) {
+    const dv = new DataView(wkbUint8.buffer, wkbUint8.byteOffset, wkbUint8.byteLength);
+    function readGeometry(offset) {
+        const byteOrder = dv.getUint8(offset); offset += 1;
+        const littleEndian = byteOrder === 1;
+        const type = dv.getUint32(offset, littleEndian); offset += 4;
+
+        function initEnv() {
+            return { minX: Infinity, minY: Infinity, maxX: -Infinity, maxY: -Infinity };
+        }
+        function addPoint(env, x, y) {
+            if (x < env.minX) env.minX = x;
+            if (y < env.minY) env.minY = y;
+            if (x > env.maxX) env.maxX = x;
+            if (y > env.maxY) env.maxY = y;
+        }
+        function readPoint(off) {
+            const x = dv.getFloat64(off, littleEndian); off += 8;
+            const y = dv.getFloat64(off, littleEndian); off += 8;
+            return { off, x, y };
+        }
+
+        if (type === 1) { // Point
+            const { off, x, y } = readPoint(offset);
+            const env = initEnv();
+            addPoint(env, x, y);
+            return { off, env };
+        }
+        if (type === 2) { // LineString
+            const n = dv.getUint32(offset, littleEndian); offset += 4;
+            const env = initEnv();
+            for (let i = 0; i < n; i++) {
+                const p = readPoint(offset); offset = p.off; addPoint(env, p.x, p.y);
+            }
+            return { off: offset, env };
+        }
+        if (type === 3) { // Polygon
+            const rings = dv.getUint32(offset, littleEndian); offset += 4;
+            const env = initEnv();
+            for (let r = 0; r < rings; r++) {
+                const n = dv.getUint32(offset, littleEndian); offset += 4;
+                for (let i = 0; i < n; i++) {
+                    const p = readPoint(offset); offset = p.off; addPoint(env, p.x, p.y);
+                }
+            }
+            return { off: offset, env };
+        }
+        if (type === 6) { // MultiPolygon
+            const n = dv.getUint32(offset, littleEndian); offset += 4;
+            const env = initEnv();
+            for (let i = 0; i < n; i++) {
+                const sub = readGeometry(offset);
+                offset = sub.off;
+                addPoint(env, sub.env.minX, sub.env.minY);
+                addPoint(env, sub.env.maxX, sub.env.maxY);
+            }
+            return { off: offset, env };
+        }
+
+        // Unsupported type: return empty env
+        return { off: offset, env: { minX: Infinity, minY: Infinity, maxX: -Infinity, maxY: -Infinity } };
+    }
+    return readGeometry(0).env;
+}
+
+function envIntersectsBbox(env, bbox) {
+    return !(env.maxX < bbox.west || env.minX > bbox.east || env.maxY < bbox.south || env.minY > bbox.north);
+}
+
+function toUint8(value) {
+    if (!value) return null;
+    if (value instanceof Uint8Array) return value;
+    if (value instanceof ArrayBuffer) return new Uint8Array(value);
+    if (ArrayBuffer.isView(value) && value.buffer) return new Uint8Array(value.buffer, value.byteOffset || 0, value.byteLength || value.length || undefined);
+    try {
+        // Some libs return { buffer, byteOffset, byteLength }
+        if (value.buffer && typeof value.byteLength === 'number') {
+            return new Uint8Array(value.buffer, value.byteOffset || 0, value.byteLength);
+        }
+    } catch (_) { /* ignore */ }
+    return null;
+}
+
+// Try to discover geometry accessors from various hyparquet result shapes
+function getGeometryAccessors(result) {
+    if (!result) return null;
+    // Case 1: columnar: result.columns.{geometry}
+    const cols = result.columns || null;
+    const geomKeyCandidates = ['geometry', 'GEOMETRY', 'geom', 'GEOM'];
+    if (cols && typeof cols === 'object') {
+        let key = geomKeyCandidates.find(k => cols[k]);
+        if (!key) {
+            // Heuristic: find first binary-like column
+            key = Object.keys(cols).find(k => {
+                const col = cols[k];
+                const sample = Array.isArray(col) ? col[0] : (col && col[0]);
+                const u8 = toUint8(sample);
+                return !!u8;
+            });
+        }
+        if (key) {
+            const column = cols[key];
+            const length = column.length || 0;
+            return {
+                length,
+                getGeomAt: (i) => toUint8(column[i])
+            };
+        }
+    }
+    // Case 2: flat arrays: result.geometry
+    for (const k of geomKeyCandidates) {
+        if (result[k] && result[k].length != null) {
+            const arr = result[k];
+            return { length: arr.length, getGeomAt: (i) => toUint8(arr[i]) };
+        }
+    }
+    // Case 3: row-wise: result.rows = [{ geometry: ... }]
+    const rows = result.rows || result.data || null;
+    if (Array.isArray(rows)) {
+        return {
+            length: rows.length,
+            getGeomAt: (i) => {
+                const row = rows[i] || {};
+                const key = geomKeyCandidates.find(k => row[k] != null);
+                return key ? toUint8(row[key]) : null;
+            }
+        };
+    }
+    return null;
+}
+
+/**
+ * Create an AsyncBuffer-like object that performs HTTP Range requests
+ */
+async function createRangeAsyncBuffer(url) {
+    const headResp = await fetch(url, { method: 'HEAD' });
+    const contentLength = parseInt(headResp.headers.get('content-length') || '0', 10);
+    if (!contentLength) {
+        throw new Error('Could not determine content-length for range reads');
+    }
+    return {
+        byteLength: contentLength,
+        async slice(start, endOrLength) {
+            let rangeHeader;
+            if (typeof endOrLength === 'number') {
+                // Interpret as end index if greater than start; otherwise as length
+                if (endOrLength > start) {
+                    rangeHeader = `bytes=${start}-${endOrLength - 1}`;
+                } else {
+                    rangeHeader = `bytes=${start}-${start + endOrLength - 1}`;
+                }
+            } else if (typeof endOrLength === 'undefined') {
+                // Open-ended range
+                rangeHeader = `bytes=${start}-`;
+            } else {
+                // Fallback: assume end index
+                rangeHeader = `bytes=${start}-${endOrLength - 1}`;
+            }
+            const res = await fetch(url, { headers: { Range: rangeHeader } });
+            if (!res.ok && res.status !== 206) {
+                throw new Error(`Range request failed: HTTP ${res.status}`);
+            }
+            // Return ArrayBuffer as required by hyparquet internals (DataView construction)
+            const ab = await res.arrayBuffer();
+            return ab;
+        },
+    };
+}
+
+/**
+ * Real Hyparquet decoding path: range-based row-group reads + bbox filtering
+ * Tries multiple API entry points to be robust across Hyparquet builds
+ */
+async function hyparquetReadWithBbox(url, bbox, { targetRows, maxRowGroups }) {
+    const hy = window.hyparquet || {};
+
+    const openStart = performance.now();
+    let reader = null;
+    let usedFallbackFullRead = false;
+
+    // Attempt to read via parquetRead using AsyncBuffer (preferred)
+    let table = null;
+    try {
+        const asyncBuffer = await createRangeAsyncBuffer(url);
+        if (hy.parquetRead) {
+            table = await hy.parquetRead({ file: asyncBuffer });
+        } else if (hy.readParquet) {
+            table = await hy.readParquet(asyncBuffer);
+        }
+        // If not available, try opening a reader next
+        if (!table && hy.ParquetReader && (hy.ParquetReader.openAsyncBuffer || hy.ParquetReader.openBuffer || hy.ParquetReader.open)) {
+            const openFn = hy.ParquetReader.openAsyncBuffer || hy.ParquetReader.openBuffer || hy.ParquetReader.open;
+            reader = await openFn(asyncBuffer);
+        } else if (!table && hy.ParquetAsyncReader && hy.ParquetAsyncReader.open) {
+            reader = await hy.ParquetAsyncReader.open(asyncBuffer);
+        }
+    } catch (e) {
+        console.warn('Hyparquet range-based read/open failed; will try fallback', e);
+    }
+
+    // Fallback: full-file fetch, then create an in-memory AsyncBuffer
+    if (!reader) {
+        usedFallbackFullRead = true;
+        try {
+            const resp = await fetch(url);
+            if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+            const fullBuf = new Uint8Array(await resp.arrayBuffer());
+            const baseOffset = fullBuf.byteOffset;
+            const backing = fullBuf.buffer;
+            const memAsyncBuffer = {
+                byteLength: fullBuf.byteLength,
+                async slice(start, endOrLength) {
+                    const startIdx = typeof start === 'number' ? start : 0;
+                    let endExclusive;
+                    if (typeof endOrLength === 'number') {
+                        if (endOrLength > startIdx) {
+                            endExclusive = endOrLength;
+                        } else {
+                            endExclusive = startIdx + endOrLength;
+                        }
+                    } else if (typeof endOrLength === 'undefined') {
+                        endExclusive = fullBuf.byteLength;
+                    } else {
+                        endExclusive = endOrLength;
+                    }
+                    const absStart = baseOffset + startIdx;
+                    const absEnd = baseOffset + endExclusive;
+                    return backing.slice(absStart, absEnd); // ArrayBuffer
+                },
+            };
+            if (hy.ParquetReader && (hy.ParquetReader.openAsyncBuffer || hy.ParquetReader.openBuffer)) {
+                const openFn = hy.ParquetReader.openAsyncBuffer || hy.ParquetReader.openBuffer;
+                reader = await openFn(memAsyncBuffer);
+            } else if (hy.ParquetReader && hy.ParquetReader.fromBuffer) {
+                reader = await hy.ParquetReader.fromBuffer(fullBuf);
+            } else if (hy.parquetRead) {
+                // Try common signature: parquetRead({ file: AsyncBuffer })
+                try {
+                    table = await hy.parquetRead({ file: memAsyncBuffer });
+                } catch (e1) {
+                    // Try passing Uint8Array directly
+                    table = await hy.parquetRead({ file: fullBuf });
+                }
+            } else if (hy.parquetReadBuffer) {
+                table = await hy.parquetReadBuffer(fullBuf);
+            } else if (hy.readParquetBuffer) {
+                table = await hy.readParquetBuffer(fullBuf);
+            } else if (hy.readParquet) {
+                // Some builds accept AsyncBuffer in readParquet
+                table = await hy.readParquet(memAsyncBuffer);
+            } else {
+                throw new Error('No suitable Hyparquet API for full read');
+            }
+        } catch (e) {
+            streamingMetrics.recordStreamingEvent('hyparquet_open_error', 'Failed to open parquet', { error: e.message });
+            throw e;
+        }
+    }
+
+    const openEnd = performance.now();
+    streamingMetrics.recordStreamingEvent('hyparquet_open', 'Opened parquet reader', {
+        durationMs: openEnd - openStart,
+        fallback: usedFallbackFullRead,
+    });
+
+    let totalBytesStreamed = 0; // Not easily measurable without hooking internal IO
+    let rowsCollected = 0;
+    let rowGroupsProcessed = 0;
+    let batchesProcessed = 0;
+    let firstBatchRecorded = false;
+
+    // Helper to iterate rows from a table-like object
+    function* iterateRowsFromTable(tbl) {
+        const cols = tbl.columns || tbl;
+        const geomCol = cols.geometry || cols.GEOMETRY || cols.geom || cols.GEOM || null;
+        const len = tbl.length || (geomCol && geomCol.length) || 0;
+        for (let i = 0; i < len; i++) {
+            const geom = geomCol ? (geomCol[i] instanceof Uint8Array ? geomCol[i] : new Uint8Array(geomCol[i])) : null;
+            yield { geometry: geom };
+        }
+    }
+
+    // Path 1: We only have a full table (no reader)
+    if (table && !reader) {
+        const acc = getGeometryAccessors(table);
+        let inBatch = 0;
+        const batchStart = performance.now();
+        if (acc && acc.length) {
+            for (let i = 0; i < acc.length; i++) {
+                const geom = acc.getGeomAt(i);
+                if (!firstBatchRecorded) { streamingMetrics.recordFirstBatch(); firstBatchRecorded = true; }
+                inBatch++;
+                if (geom) {
+                    const env = wkbEnvelope(geom);
+                    if (envIntersectsBbox(env, bbox)) rowsCollected++;
+                }
+                if (inBatch >= 512) {
+                    const batchEnd = performance.now();
+                    streamingMetrics.recordRowGroupBatch(batchesProcessed, inBatch, batchStart, batchEnd, { filteredRows: rowsCollected, url });
+                    batchesProcessed++;
+                    inBatch = 0;
+                }
+                if (rowsCollected >= targetRows) break;
+            }
+            if (inBatch > 0) {
+                streamingMetrics.recordRowGroupBatch(batchesProcessed, inBatch, batchStart, performance.now(), { filteredRows: rowsCollected, url });
+                batchesProcessed++;
+            }
+            rowGroupsProcessed = Math.max(rowGroupsProcessed, 1);
+        }
+        return { totalBytesStreamed, rowsCollected, rowGroupsProcessed, batchesProcessed, earlyTermination: rowsCollected >= targetRows };
+    }
+
+    // Path 2: Iterate row groups via reader
+    let rowGroupCount = 0;
+    try {
+        rowGroupCount = (reader.getRowGroupCount && reader.getRowGroupCount()) || (reader.rowGroups && reader.rowGroups.length) || 0;
+    } catch (e) {
+        rowGroupCount = 0;
+    }
+    if (!rowGroupCount) {
+        // Fallback: try reading via table path (we may already have table)
+        if (table) {
+            if (!firstBatchRecorded) { streamingMetrics.recordFirstBatch(); firstBatchRecorded = true; }
+            let inBatch = 0;
+            const batchStart = performance.now();
+            const rows = table.length || (table.columns && table.columns.geometry && table.columns.geometry.length) || 0;
+            for (let i = 0; i < rows; i++) {
+                const geom = (table.geometry && table.geometry[i]) || (table.columns && table.columns.geometry && table.columns.geometry[i]) || null;
+                if (geom) {
+                    const u8 = geom instanceof Uint8Array ? geom : new Uint8Array(geom);
+                    const env = wkbEnvelope(u8);
+                    if (envIntersectsBbox(env, bbox)) rowsCollected++;
+                }
+                inBatch++;
+                if (inBatch >= 512) {
+                    streamingMetrics.recordRowGroupBatch(batchesProcessed, inBatch, batchStart, performance.now(), { filteredRows: rowsCollected, url });
+                    batchesProcessed++;
+                    inBatch = 0;
+                }
+                if (rowsCollected >= targetRows) break;
+            }
+            return { totalBytesStreamed, rowsCollected, rowGroupsProcessed, batchesProcessed, earlyTermination: rowsCollected >= targetRows };
+        }
+        // As a last resort, attempt reader.read if present
+        try {
+            if (reader && reader.read) {
+                const all = await reader.read({ columns: ['StateAbbr', 'Tract', 'geometry'] });
+                if (!firstBatchRecorded) { streamingMetrics.recordFirstBatch(); firstBatchRecorded = true; }
+                let filtered = 0;
+                const rows = all.length || (all.columns && all.columns.geometry && all.columns.geometry.length) || 0;
+                for (let i = 0; i < rows; i++) {
+                    const geom = (all.geometry && all.geometry[i]) || (all.columns && all.columns.geometry && all.columns.geometry[i]) || null;
+                    if (geom) {
+                        const u8 = geom instanceof Uint8Array ? geom : new Uint8Array(geom);
+                        const env = wkbEnvelope(u8);
+                        if (envIntersectsBbox(env, bbox)) filtered++;
+                    }
+                    if ((rowsCollected + filtered) >= targetRows) break;
+                }
+                rowsCollected += filtered;
+                streamingMetrics.recordRowGroupBatch(batchesProcessed, rows, performance.now(), performance.now(), { filteredRows: filtered, url });
+                batchesProcessed++;
+                return { totalBytesStreamed, rowsCollected, rowGroupsProcessed, batchesProcessed, earlyTermination: rowsCollected >= targetRows };
+            }
+        } catch (e) {
+            streamingMetrics.recordStreamingEvent('hyparquet_read_error', 'Reader read() failed', { error: e.message });
+        }
+        return { totalBytesStreamed, rowsCollected, rowGroupsProcessed, batchesProcessed, earlyTermination: rowsCollected >= targetRows };
+    }
+
+    for (let rg = 0; rg < rowGroupCount; rg++) {
+        const batchStart = performance.now();
+        let rgData = null;
+        try {
+            if (reader.readRowGroup) {
+                rgData = await reader.readRowGroup(rg, { columns: ['StateAbbr', 'Tract', 'geometry'] });
+            } else if (reader.read) {
+                rgData = await reader.read({ rowGroup: rg, columns: ['StateAbbr', 'Tract', 'geometry'] });
+            } else if (reader.getRowGroup) {
+                rgData = await reader.getRowGroup(rg);
+            }
+        } catch (e) {
+            streamingMetrics.recordStreamingEvent('rowgroup_read_error', `Failed to read row group ${rg}`, { error: e.message });
+            continue;
+        }
+
+        if (!firstBatchRecorded) { streamingMetrics.recordFirstBatch(); firstBatchRecorded = true; }
+
+        const acc = getGeometryAccessors(rgData);
+        let filteredRows = 0;
+        let rows = 0;
+        if (acc && acc.length) {
+            rows = acc.length;
+            for (let i = 0; i < rows; i++) {
+                const geom = acc.getGeomAt(i);
+                if (geom) {
+                    const env = wkbEnvelope(geom);
+                    if (envIntersectsBbox(env, bbox)) filteredRows++;
+                }
+                if ((rowsCollected + filteredRows) >= targetRows) break;
+            }
+        }
+
+        rowsCollected += filteredRows;
+        rowGroupsProcessed++;
+        const batchEnd = performance.now();
+        streamingMetrics.recordRowGroupBatch(batchesProcessed, rows, batchStart, batchEnd, { filteredRows, url, rowGroupIndex: rg });
+        batchesProcessed++;
+
+        if (rowsCollected >= targetRows || rowGroupsProcessed >= maxRowGroups) break;
+
+        if (batchesProcessed % 3 === 0) {
+            streamingMetrics.takeMemorySnapshot(`rowgroup_${rg}`);
+        }
+    }
+
+    return { totalBytesStreamed, rowsCollected, rowGroupsProcessed, batchesProcessed, earlyTermination: rowsCollected >= targetRows || rowGroupsProcessed >= maxRowGroups };
+}
+
+/**
  * Simulate processing a row group chunk
  */
 async function processRowGroup(chunkData) {
@@ -336,6 +760,9 @@ class StreamingProgressTracker {
 
 // Make test function available globally
 window.testHyparquetStrategy = testHyparquetStrategy;
+
+// Expose real hyparquet reader to other modules
+window.hyparquetReadWithBbox = hyparquetReadWithBbox;
 
 // Error handling for streaming operations
 function handleStreamingError(error, context) {

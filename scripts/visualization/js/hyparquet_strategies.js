@@ -133,97 +133,27 @@ const HyparquetStrategies = {
         let earlyTermination = false;
 
         try {
-            // Start HTTP request
-            const httpStart = performance.now();
-            const response = await fetch(url);
-            const httpEnd = performance.now();
-            
-            if (!response.ok) {
-                throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+            // Real Hyparquet decoding path with range requests and bbox filtering
+            if (typeof window.hyparquetReadWithBbox === 'function') {
+                const real = await window.hyparquetReadWithBbox(url, bbox, { targetRows, maxRowGroups });
+                totalBytesStreamed = real.totalBytesStreamed || 0;
+                rowsCollected = real.rowsCollected || 0;
+                rowGroupsProcessed = real.rowGroupsProcessed || 0;
+                batchesProcessed = real.batchesProcessed || 0;
+                earlyTermination = real.earlyTermination || false;
+            } else {
+                // Fallback to simulated streaming if real reader not available
+                const simulated = await simulateHyparquetStreaming(url, {
+                    targetRows,
+                    maxRowGroups,
+                    chunkSize: 64 * 1024
+                });
+                totalBytesStreamed = simulated.totalBytesRead;
+                rowsCollected = simulated.rowsCollected;
+                rowGroupsProcessed = simulated.rowGroupsProcessed;
+                batchesProcessed = Math.max(1, Math.ceil(simulated.rowsCollected / 500));
+                earlyTermination = simulated.earlyTermination;
             }
-
-            const contentLength = parseInt(response.headers.get('content-length')) || 0;
-            streamingMetrics.recordStreamingRequest(url, httpStart, httpEnd, contentLength);
-
-            // Get response as readable stream
-            const reader = response.body.getReader();
-            const chunks = [];
-            let bytesReceived = 0;
-
-            // Read stream in chunks
-            while (true) {
-                const { done, value } = await reader.read();
-                
-                if (done) break;
-
-                chunks.push(value);
-                bytesReceived += value.length;
-                totalBytesStreamed += value.length;
-
-                // Record first batch timing
-                if (chunks.length === 1) {
-                    streamingMetrics.recordFirstBatch();
-                }
-
-                // Process chunk if we have enough data or this is the final chunk
-                if (bytesReceived > 64 * 1024 || done) { // Process every 64KB or at end
-                    const batchStart = performance.now();
-                    
-                    // Combine chunks for processing
-                    const combinedArray = new Uint8Array(bytesReceived);
-                    let offset = 0;
-                    for (const chunk of chunks) {
-                        combinedArray.set(chunk, offset);
-                        offset += chunk.length;
-                    }
-
-                    // Simulate Hyparquet streaming processing
-                    const { rowsInBatch, filteredRows } = await this._processStreamChunk(
-                        combinedArray, 
-                        bbox, 
-                        batchesProcessed
-                    );
-
-                    const batchEnd = performance.now();
-                    
-                    streamingMetrics.recordRowGroupBatch(
-                        batchesProcessed, 
-                        rowsInBatch, 
-                        batchStart, 
-                        batchEnd, 
-                        { filteredRows, url, hexagonId }
-                    );
-
-                    rowsCollected += filteredRows;
-                    batchesProcessed++;
-                    rowGroupsProcessed++;
-
-                    // Record row collection
-                    const efficiency = rowsInBatch > 0 ? (filteredRows / rowsInBatch) * 100 : 0;
-                    streamingMetrics.recordRowCollection(filteredRows, 'bbox_filter', efficiency);
-
-                    // Check for early termination conditions
-                    if (rowsCollected >= targetRows || rowGroupsProcessed >= maxRowGroups) {
-                        const reason = rowsCollected >= targetRows ? 'target_rows_reached' : 'max_row_groups_reached';
-                        streamingMetrics.recordEarlyTermination(reason, targetRows, rowsCollected);
-                        earlyTermination = true;
-                        reader.releaseLock();
-                        break;
-                    }
-
-                    // Clear processed chunks
-                    chunks.length = 0;
-                    bytesReceived = 0;
-
-                    // Take memory snapshot periodically
-                    if (batchesProcessed % 3 === 0) {
-                        streamingMetrics.takeMemorySnapshot(`batch_${batchesProcessed}`);
-                    }
-                }
-            }
-
-            reader.releaseLock();
-
         } catch (error) {
             streamingMetrics.recordStreamingEvent('stream_error', `Stream failed: ${error.message}`, { url, error: error.message });
             throw error;
