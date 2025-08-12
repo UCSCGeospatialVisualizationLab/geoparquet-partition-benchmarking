@@ -6,7 +6,7 @@ A comprehensive performance testing framework for evaluating different parquet p
 
 This project evaluates the performance trade-offs of different parquet partitioning strategies for large geospatial datasets, specifically using the Census tract data from the HAZUS dataset (FEMA). The testing framework uses realistic cloud-native patterns with S3 storage and HTTP access.
 
-**Dataset**: `s3://vizlab-geodatalake/hazus/vector/hazus_CensusTract.parquet` (~1.6GB)  
+**Dataset**: `s3://vizlab-geodatalake-exports/hazus/vector/hazus_CensusTract.parquet` (~1.52GB, 85,141 census tracts)  
 **Environment**: 4-core Docker container with network monitoring  
 **Objective**: Optimize partitioning strategies for both analytics and visualization workloads
 
@@ -17,11 +17,13 @@ This project evaluates the performance trade-offs of different parquet partition
 3. **Hybrid Spatial + Attribute** (state_code ➜ H3 subfolders, ~40 MB)
 4. **No Partitioning** (single ~1.6 GB file, control case)
 
-## 🖥️ Visualization Clients
+## 🖥️ Visualization Clients ✅ COMPLETED
 
-1. **Full Parquet Download** → Apache Arrow JS/WASM
-2. **Hyparquet** (incremental columnar streaming)
-3. **DuckDB-WASM** (HTTP range requests)
+1. **Arrow.js + parquet-wasm**: Full HTTP download + real Parquet parsing + in-memory Arrow processing
+2. **Hyparquet**: Incremental columnar streaming with progressive row group processing
+3. **DuckDB-WASM**: SQL queries with HTTP range requests and spatial extensions
+
+**All three clients are fully functional** and ready for performance testing against all 4 partitioning strategies.
 
 ## 📁 Project Structure
 
@@ -81,7 +83,7 @@ make stop     # Stop Docker environment
    # Edit .env with your AWS credentials:
    #   AWS_ACCESS_KEY_ID=your_key
    #   AWS_SECRET_ACCESS_KEY=your_secret  
-   #   TEST_S3_BUCKET=geoparquest-performance-test-bucket
+   #   AWS_ENDPOINT_URL=https://s3-west.nrp-nautilus.io
    ```
 
 3. **Run Setup**:
@@ -123,7 +125,7 @@ Edit `s3_config/s3_config.yaml` to customize:
 ### Environment Variables
 Key settings in `.env`:
 - `AWS_*`: AWS credentials and region
-- `TEST_S3_BUCKET`: Your test bucket name (e.g., `geoparquest-performance-test-bucket`)
+- `AWS_ENDPOINT_URL`: Ceph S3 endpoint (https://s3-west.nrp-nautilus.io)
 - `TEST_RUNS`: Number of test iterations
 - `DOCKER_CPU_LIMIT`: Resource constraints
 
@@ -155,10 +157,16 @@ See `PERFORMANCE_TEST_PLAN.md` for detailed step-by-step progress tracking.
 
 **Current Status**: 
 - ✅ Step 1: Project Structure Setup
-- ⏳ Step 2: S3 Data Exploration  
-- ⏳ Step 3: S3 Partitioning Setup
-- ⏳ Step 4: Partitioning Implementation
-- ... (see plan for full details)
+- ✅ Step 2: S3 Data Exploration (1.52GB, 85,141 tracts, 56 states)
+- ✅ Step 3: S3 Partitioning Setup (Ceph S3 bucket structure)
+- ✅ Step 4: Partitioning Implementation (parallel uploads, H3 L3)
+- ✅ Step 5: Analytical Queries (5 DuckDB queries with S3 HTTP access)
+- ✅ Step 6: Visualization Clients **FULLY COMPLETED** 🎉
+  - ✅ **Arrow.js + parquet-wasm**: Real Parquet parsing with graceful large file handling
+  - ✅ **Hyparquet Streaming**: Progressive row group streaming with CDN loading
+  - ✅ **DuckDB-WASM SQL**: Spatial SQL queries with HTTP range requests and local WASM files
+- 🔄 Step 7: Performance Analysis (Ready to execute comprehensive tests)
+- ... (see PERFORMANCE_TEST_PLAN.md for full details)
 
 ## 🤝 Support
 

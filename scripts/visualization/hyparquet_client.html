@@ -1,0 +1,364 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Hyparquet Client Performance Test</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            margin: 20px;
+            background-color: #f5f5f5;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        .test-controls {
+            background: #f8f9fa;
+            padding: 15px;
+            border-radius: 5px;
+            margin-bottom: 20px;
+        }
+        .results-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 15px;
+            margin-top: 20px;
+        }
+        .result-card {
+            background: white;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+            padding: 15px;
+        }
+        .result-card h3 {
+            margin: 0 0 10px 0;
+            color: #333;
+        }
+        .metric {
+            display: flex;
+            justify-content: space-between;
+            padding: 2px 0;
+        }
+        .metric-value {
+            font-weight: bold;
+            color: #28a745;
+        }
+        .streaming-progress {
+            background: #e9ecef;
+            height: 8px;
+            border-radius: 4px;
+            overflow: hidden;
+            margin: 8px 0;
+        }
+        .streaming-progress-bar {
+            background: linear-gradient(90deg, #28a745, #20c997);
+            height: 100%;
+            transition: width 0.2s;
+        }
+        button {
+            background: #28a745;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 5px;
+            cursor: pointer;
+            margin-right: 10px;
+        }
+        button:hover {
+            background: #218838;
+        }
+        button:disabled {
+            background: #6c757d;
+            cursor: not-allowed;
+        }
+        .progress {
+            background: #e9ecef;
+            height: 20px;
+            border-radius: 10px;
+            overflow: hidden;
+            margin: 10px 0;
+        }
+        .progress-bar {
+            background: #28a745;
+            height: 100%;
+            transition: width 0.3s;
+        }
+        .status {
+            font-style: italic;
+            color: #666;
+            margin: 10px 0;
+        }
+        .error {
+            color: #dc3545;
+            font-weight: bold;
+        }
+        .bbox-info {
+            background: #e7f3ff;
+            padding: 10px;
+            border-radius: 5px;
+            margin-bottom: 15px;
+            font-size: 14px;
+        }
+        .streaming-info {
+            background: #f8f9fa;
+            padding: 10px;
+            border-radius: 5px;
+            margin-bottom: 15px;
+            font-size: 13px;
+            border-left: 4px solid #28a745;
+        }
+        .batch-counter {
+            display: inline-block;
+            background: #007bff;
+            color: white;
+            padding: 2px 8px;
+            border-radius: 12px;
+            font-size: 12px;
+            margin-left: 10px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Hyparquet Client Performance Test</h1>
+        <p>Testing incremental columnar streaming across 4 parquet partitioning strategies</p>
+        
+        <div class="bbox-info">
+            <strong>Test Region:</strong> California Bay Area<br>
+            <strong>Bounding Box:</strong> West: -122.6, South: 37.2, East: -121.8, North: 38.0
+        </div>
+
+        <div class="streaming-info">
+            <strong>🌊 Hyparquet Streaming:</strong> Progressive row group loading with real-time filtering and early termination when sufficient data is collected.
+        </div>
+
+        <div class="test-controls">
+            <button onclick="runSingleTest('no_partition')" id="btn-no-partition">Test: No Partition</button>
+            <button onclick="runSingleTest('attribute_state')" id="btn-attribute-state">Test: State-Based</button>
+            <button onclick="runSingleTest('spatial_h3_l3')" id="btn-spatial-h3">Test: Spatial H3</button>
+            <button onclick="runSingleTest('hybrid_state_h3')" id="btn-hybrid">Test: Hybrid</button>
+            <button onclick="runAllTests()" id="btn-run-all">Run All Tests</button>
+            <button onclick="exportResults()" id="btn-export">Export Results</button>
+        </div>
+
+        <div class="progress" id="progress-container" style="display: none;">
+            <div class="progress-bar" id="progress-bar" style="width: 0%;"></div>
+        </div>
+        <div class="status" id="status"></div>
+
+        <div class="results-grid" id="results-grid">
+            <!-- Results will be populated here -->
+        </div>
+    </div>
+
+    <script type="module" src="js/streaming_metrics.js"></script>
+    <script type="module" src="js/hyparquet_strategies.js"></script>
+    <script type="module" src="js/hyparquet_loader.js"></script>
+    <script>
+        // Global test results storage
+        let testResults = {};
+        const TEST_BBOX = {
+            west: -122.6,
+            south: 37.2,
+            east: -121.8,
+            north: 38.0
+        };
+
+        const BASE_URL = 'https://s3-west.nrp-nautilus.io/vizlab-geodatalake-exports/hazus-performance-test';
+
+        // Main test orchestration
+        async function runSingleTest(strategy) {
+            updateStatus(`Running ${strategy} streaming test...`);
+            disableButtons();
+            showProgress();
+            
+            try {
+                const result = await testHyparquetStrategy(strategy, TEST_BBOX);
+                testResults[strategy] = result;
+                displayResult(strategy, result);
+                updateStatus(`${strategy} streaming test completed successfully`);
+            } catch (error) {
+                updateStatus(`${strategy} test failed: ${error.message}`, true);
+                console.error(`Test ${strategy} error:`, error);
+            }
+            
+            hideProgress();
+            enableButtons();
+        }
+
+        async function runAllTests() {
+            updateStatus('Running all Hyparquet streaming tests...');
+            disableButtons();
+            showProgress();
+            
+            const strategies = ['no_partition', 'attribute_state', 'spatial_h3_l3', 'hybrid_state_h3'];
+            let completed = 0;
+            
+            for (const strategy of strategies) {
+                try {
+                    updateStatus(`Streaming ${strategy}... (${completed + 1}/${strategies.length})`);
+                    updateProgress((completed / strategies.length) * 100);
+                    
+                    const result = await testHyparquetStrategy(strategy, TEST_BBOX);
+                    testResults[strategy] = result;
+                    displayResult(strategy, result);
+                    completed++;
+                } catch (error) {
+                    updateStatus(`${strategy} failed: ${error.message}`, true);
+                    console.error(`Test ${strategy} error:`, error);
+                }
+            }
+            
+            updateProgress(100);
+            updateStatus(`All streaming tests completed (${completed}/${strategies.length} successful)`);
+            hideProgress();
+            enableButtons();
+        }
+
+        function displayResult(strategy, result) {
+            const resultsGrid = document.getElementById('results-grid');
+            
+            // Remove existing result if any
+            const existingCard = document.getElementById(`result-${strategy}`);
+            if (existingCard) {
+                existingCard.remove();
+            }
+            
+            const card = document.createElement('div');
+            card.className = 'result-card';
+            card.id = `result-${strategy}`;
+            
+            card.innerHTML = `
+                <h3>${formatStrategyName(strategy)}</h3>
+                <div class="metric">
+                    <span>Stream Time:</span>
+                    <span class="metric-value">${result.streamingTime.toFixed(2)}ms</span>
+                </div>
+                <div class="metric">
+                    <span>Row Groups:</span>
+                    <span class="metric-value">${result.rowGroupsStreamed}<span class="batch-counter">${result.batchesProcessed} batches</span></span>
+                </div>
+                <div class="metric">
+                    <span>Bytes Streamed:</span>
+                    <span class="metric-value">${formatBytes(result.totalBytesStreamed)}</span>
+                </div>
+                <div class="metric">
+                    <span>First Batch:</span>
+                    <span class="metric-value">${result.timeToFirstBatch.toFixed(2)}ms</span>
+                </div>
+                <div class="metric">
+                    <span>Rows Collected:</span>
+                    <span class="metric-value">${result.rowsCollected.toLocaleString()}</span>
+                </div>
+                <div class="metric">
+                    <span>Stream Efficiency:</span>
+                    <span class="metric-value">${result.streamEfficiency.toFixed(1)}%</span>
+                </div>
+                <div class="metric">
+                    <span>Early Termination:</span>
+                    <span class="metric-value">${result.earlyTermination ? '✅ Yes' : '❌ No'}</span>
+                </div>
+                <div class="metric">
+                    <span>Data Rate:</span>
+                    <span class="metric-value">${(result.totalBytesStreamed / result.streamingTime * 1000 / 1024 / 1024).toFixed(2)} MB/s</span>
+                </div>
+            `;
+            
+            resultsGrid.appendChild(card);
+        }
+
+        function exportResults() {
+            const resultsJson = JSON.stringify({
+                testConfig: {
+                    bbox: TEST_BBOX,
+                    timestamp: new Date().toISOString(),
+                    userAgent: navigator.userAgent,
+                    hyparquetVersion: '1.17.1',
+                    testType: 'hyparquet_streaming'
+                },
+                results: testResults
+            }, null, 2);
+            
+            const blob = new Blob([resultsJson], { type: 'application/json' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `hyparquet_client_results_${new Date().toISOString().slice(0,19).replace(/:/g, '')}.json`;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+            
+            updateStatus('Streaming results exported successfully');
+        }
+
+        // UI helper functions
+        function updateStatus(message, isError = false) {
+            const status = document.getElementById('status');
+            status.textContent = message;
+            status.className = isError ? 'status error' : 'status';
+        }
+
+        function showProgress() {
+            document.getElementById('progress-container').style.display = 'block';
+        }
+
+        function hideProgress() {
+            document.getElementById('progress-container').style.display = 'none';
+        }
+
+        function updateProgress(percentage) {
+            document.getElementById('progress-bar').style.width = `${percentage}%`;
+        }
+
+        function disableButtons() {
+            const buttons = document.querySelectorAll('button');
+            buttons.forEach(btn => btn.disabled = true);
+        }
+
+        function enableButtons() {
+            const buttons = document.querySelectorAll('button');
+            buttons.forEach(btn => btn.disabled = false);
+        }
+
+        function formatStrategyName(strategy) {
+            const names = {
+                'no_partition': 'No Partition (Streaming)',
+                'attribute_state': 'Attribute-Based (State)',
+                'spatial_h3_l3': 'Spatial H3 Grid',
+                'hybrid_state_h3': 'Hybrid State+H3'
+            };
+            return names[strategy] || strategy;
+        }
+
+        function formatBytes(bytes) {
+            if (bytes === 0) return '0 B';
+            const k = 1024;
+            const sizes = ['B', 'KB', 'MB', 'GB'];
+            const i = Math.floor(Math.log(bytes) / Math.log(k));
+            return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+        }
+
+        // Initialize page
+        document.addEventListener('DOMContentLoaded', async function() {
+            updateStatus('Loading Hyparquet library...');
+            try {
+                // Import hyparquet from unpkg CDN (main entry point)
+                window.hyparquet = await import('https://unpkg.com/hyparquet@1.17.1');
+                console.log('Hyparquet library loaded successfully');
+                console.log('Hyparquet exports:', Object.keys(window.hyparquet));
+                updateStatus('Ready to run Hyparquet streaming tests');
+            } catch (error) {
+                console.error('Hyparquet library failed to load:', error);
+                updateStatus('Error: Hyparquet library failed to load', true);
+            }
+        });
+    </script>
+</body>
+</html>

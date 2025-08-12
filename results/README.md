@@ -2,6 +2,32 @@
 
 This directory stores all performance test results and measurement data.
 
+## 🎉 Latest Results Summary
+
+### ✅ Analytical Benchmark Complete (2025-08-12)
+**File**: `analytical_benchmark_20250812_100506.json`
+
+| Strategy | Total Time | Peak Memory | Best For |
+|----------|------------|-------------|----------|
+| **ATTRIBUTE_STATE** | **33.93s** ⚡ | 30.7MB | State-based analytics |
+| **NO_PARTITION** | 119.59s | 58.4MB | Simple queries |
+| **HYBRID_STATE_H3** | 241.42s | **27.8MB** 💾 | Mixed workloads |
+| **SPATIAL_H3_L3** | 405.05s | 30.2MB | Spatial-heavy queries |
+
+**Key Finding**: Attribute-based partitioning provides **3.5x better performance** than no partitioning for analytical workloads.
+
+### ✅ Visualization Clients Complete
+**Status**: All 3 clients functional and tested
+- **Arrow.js + parquet-wasm**: Real Parquet parsing ✅
+- **Hyparquet**: Progressive streaming ✅  
+- **DuckDB-WASM**: Spatial SQL queries ✅
+
+### ✅ S3 Data Architecture Complete
+**Files**: `s3_bucket_setup.json`, `s3_data_exploration.json`, `partitioning_results.json`, `h3_hexagon_discovery.json`
+- **Dataset**: 85,141 census tracts (1.52GB)
+- **Partitioning**: 4 strategies implemented and tested
+- **H3 Discovery**: Working hexagons identified for Bay Area testing
+
 ## Directory Structure
 
 ```
@@ -39,7 +65,7 @@ results/
 {test_type}_{partition_strategy}_{client_type}_{timestamp}.{format}
 
 Examples:
-- analytics_spatial_h3_l6_duckdb_20240315_143022.json
+- analytics_spatial_h3_l4_duckdb_20240315_143022.json
 - visualization_no_partition_arrow_20240315_143045.json  
 - network_hybrid_state_h3_hyparquet_20240315_143108.csv
 ```

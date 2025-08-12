@@ -16,8 +16,7 @@ import sys
 from pathlib import Path
 from dotenv import load_dotenv
 import argparse
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import threading
+
 
 # Add project root to path
 sys.path.append(str(Path(__file__).parent.parent.parent))
@@ -27,13 +26,12 @@ load_dotenv()
 
 
 class PartitionCreator:
-    def __init__(self, config, max_workers=16):
+    def __init__(self, config):
         self.config = config
         self.s3_client = self._get_s3_client()
         self.source_url = config["source"]["url"]
         self.target_bucket = config["test_bucket"]["bucket"]
         self.target_prefix = config["test_bucket"]["prefix"]
-        self.max_workers = max_workers
 
         # Initialize DuckDB with S3 support
         self.conn = duckdb.connect()
@@ -42,11 +40,11 @@ class PartitionCreator:
         self.conn.execute("INSTALL spatial;")
         self.conn.execute("LOAD spatial;")
 
+        # Enable progress bar for long-running operations
+        self.conn.execute("SET enable_progress_bar = true;")
+
         # Configure DuckDB for Ceph S3
         self._configure_duckdb_s3()
-
-        # Thread lock for DuckDB operations (DuckDB is not thread-safe)
-        self.db_lock = threading.Lock()
 
     def _get_s3_client(self):
         """Get S3 client with proper endpoint configuration"""
@@ -70,54 +68,6 @@ class PartitionCreator:
             self.conn.execute(f"SET s3_endpoint='{endpoint_host}';")
             self.conn.execute("SET s3_use_ssl=true;")
             self.conn.execute("SET s3_url_style='path';")
-
-    def _create_partition_worker(self, partition_data, query_template, target_url):
-        """Worker function for creating individual partitions in parallel"""
-        try:
-            # Create a new DuckDB connection for this thread
-            thread_conn = duckdb.connect()
-            thread_conn.execute("INSTALL httpfs;")
-            thread_conn.execute("LOAD httpfs;")
-            thread_conn.execute("INSTALL spatial;")
-            thread_conn.execute("LOAD spatial;")
-
-            # Configure S3 for this connection
-            endpoint_url = os.getenv("AWS_ENDPOINT_URL")
-            if endpoint_url:
-                if endpoint_url.startswith("https://"):
-                    endpoint_host = endpoint_url.replace("https://", "")
-                elif endpoint_url.startswith("http://"):
-                    endpoint_host = endpoint_url.replace("http://", "")
-                else:
-                    endpoint_host = endpoint_url
-
-                thread_conn.execute(f"SET s3_endpoint='{endpoint_host}';")
-                thread_conn.execute("SET s3_use_ssl=true;")
-                thread_conn.execute("SET s3_url_style='path';")
-
-            # Execute the partition query
-            if isinstance(partition_data, pd.DataFrame):
-                # For DataFrame-based partitions (H3)
-                thread_conn.register("partition_data", partition_data)
-                thread_conn.execute(query_template)
-            else:
-                # For direct SQL queries (state-based)
-                query = query_template.format(**partition_data)
-                thread_conn.execute(query)
-
-            thread_conn.close()
-            return {
-                "success": True,
-                "target_url": target_url,
-                "rows": (
-                    len(partition_data)
-                    if isinstance(partition_data, pd.DataFrame)
-                    else None
-                ),
-            }
-
-        except Exception as e:
-            return {"success": False, "target_url": target_url, "error": str(e)}
 
     def create_no_partition_dataset(self):
         """Strategy 1: No partitioning - copy source file as-is"""
@@ -156,97 +106,49 @@ class PartitionCreator:
             return None
 
     def create_attribute_state_dataset(self):
-        """Strategy 2: Partition by StateAbbr (Parallelized)"""
-        print("🗺️  Creating Attribute State Dataset...")
+        """Strategy 2: Partition by StateAbbr using DuckDB Hive partitioning"""
+        print("🗺️  Creating Attribute State Dataset with Hive Partitioning...")
 
         strategy_path = self.config["partitioning_strategies"]["attribute_state"][
             "path"
         ]
+        target_path = f"s3://{self.target_bucket}/{self.target_prefix}{strategy_path}"
 
         try:
             start_time = time.time()
 
-            # Get list of unique states
-            states_query = (
-                f"SELECT DISTINCT StateAbbr FROM '{self.source_url}' ORDER BY StateAbbr"
-            )
-            states_df = self.conn.execute(states_query).df()
-            states = states_df["StateAbbr"].tolist()
+            print("   📊 Using DuckDB PARTITION_BY for Hive partitioning...")
+            print(f"   📁 Target path: {target_path}")
 
-            print(
-                f"   📊 Partitioning into {len(states)} state files using {self.max_workers} parallel workers..."
-            )
+            # Use DuckDB's native Hive partitioning with PARTITION_BY
+            copy_query = f"""
+            COPY (
+                SELECT StateAbbr, Tract, geometry 
+                FROM '{self.source_url}'
+            ) TO '{target_path}' (
+                FORMAT PARQUET,
+                COMPRESSION 'snappy',
+                PARTITION_BY (StateAbbr),
+                OVERWRITE_OR_IGNORE
+            );
+            """
 
-            # Prepare partition tasks
-            partition_tasks = []
-            for state in states:
-                target_key = f"{self.target_prefix}{strategy_path}StateAbbr={state}/hazus_tracts.parquet"
-                target_url = f"s3://{self.target_bucket}/{target_key}"
-
-                query_template = f"""
-                COPY (
-                    SELECT StateAbbr, Tract, geometry 
-                    FROM '{self.source_url}' 
-                    WHERE StateAbbr = '{state}'
-                ) TO '{target_url}' (FORMAT PARQUET, COMPRESSION 'snappy');
-                """
-
-                partition_tasks.append(
-                    {
-                        "partition_data": {"state": state},
-                        "query_template": query_template,
-                        "target_url": target_url,
-                        "state": state,
-                    }
-                )
-
-            # Execute partitions in parallel
-            created_files = []
-            failed_files = []
-
-            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-                # Submit all tasks
-                future_to_task = {
-                    executor.submit(
-                        self._create_partition_worker,
-                        task["partition_data"],
-                        task["query_template"],
-                        task["target_url"],
-                    ): task
-                    for task in partition_tasks
-                }
-
-                # Process completed tasks
-                for future in as_completed(future_to_task):
-                    task = future_to_task[future]
-                    result = future.result()
-
-                    if result["success"]:
-                        created_files.append(result["target_url"])
-                        if len(created_files) <= 5:  # Show first few
-                            print(f"      ✅ {task['state']}: {result['target_url']}")
-                        elif len(created_files) == 6:
-                            print(
-                                f"      ... (showing first 5, completing {len(states)} total)"
-                            )
-                    else:
-                        failed_files.append(result)
-                        print(f"      ❌ {task['state']}: {result['error']}")
+            print("   🚀 Executing Hive partitioned write...")
+            self.conn.execute(copy_query)
 
             duration = time.time() - start_time
+            print(f"   ✅ Completed Hive partitioning in {duration:.2f}s")
 
-            if failed_files:
-                print(
-                    f"   ⚠️  Completed {len(created_files)} files, {len(failed_files)} failed in {duration:.2f}s"
-                )
-            else:
-                print(f"   ✅ Completed {len(created_files)} files in {duration:.2f}s")
+            # Count partitions created (estimate based on unique states)
+            count_query = f"SELECT COUNT(DISTINCT StateAbbr) as state_count FROM '{self.source_url}'"
+            state_count = self.conn.execute(count_query).fetchone()[0]
 
             return {
                 "strategy": "attribute_state",
-                "files_created": len(created_files),
-                "files_failed": len(failed_files),
-                "target_paths": created_files[:5],  # First 5 for brevity
+                "partitioning_type": "hive",
+                "partition_column": "StateAbbr",
+                "estimated_partitions": state_count,
+                "target_path": target_path,
                 "duration_seconds": duration,
             }
 
@@ -283,12 +185,13 @@ class PartitionCreator:
         return True
 
     def create_spatial_h3_dataset(self):
-        """Strategy 3: Partition by H3 level 6 hexagons"""
-        print("🏬 Creating Spatial H3 Dataset...")
+        """Strategy 3: Partition by H3 hexagons using DuckDB Hive partitioning"""
+        print("🏬 Creating Spatial H3 Dataset with Hive Partitioning...")
 
-        strategy_config = self.config["partitioning_strategies"]["spatial_h3_l6"]
+        strategy_config = self.config["partitioning_strategies"]["spatial_h3_l3"]
         strategy_path = strategy_config["path"]
         h3_level = strategy_config["h3_level"]
+        target_path = f"s3://{self.target_bucket}/{self.target_prefix}{strategy_path}"
 
         try:
             start_time = time.time()
@@ -299,8 +202,7 @@ class PartitionCreator:
 
             print(f"   🔢 Computing H3 level {h3_level} hexagon indices...")
 
-            # Add H3 column using Python UDF since DuckDB doesn't have native H3
-            # First get all data with coordinates
+            # Get all data with coordinates
             data_query = """
             SELECT StateAbbr, Tract, geometry, longitude, latitude 
             FROM tract_centroids
@@ -308,7 +210,10 @@ class PartitionCreator:
             df = self.conn.execute(data_query).df()
 
             # Add H3 indices
-            df["h3_level6"] = df.apply(
+            h3_column = f"h3_level{h3_level}"
+            print(f"   🔢 Computing {len(df):,} H3 level {h3_level} indices...")
+
+            df[h3_column] = df.apply(
                 lambda row: (
                     h3.geo_to_h3(row["latitude"], row["longitude"], h3_level)
                     if pd.notna(row["latitude"]) and pd.notna(row["longitude"])
@@ -318,91 +223,48 @@ class PartitionCreator:
             )
 
             # Filter out any records without valid H3 indices
-            df = df.dropna(subset=["h3_level6"])
+            df = df.dropna(subset=[h3_column])
+            print(f"   ✅ Generated {len(df):,} valid H3 indices")
 
-            # Get unique H3 cells
-            h3_cells = df["h3_level6"].unique()
-            print(f"   📊 Partitioning into {len(h3_cells)} H3 hexagon files...")
-
-            # Prepare partition tasks
-            partition_tasks = []
-            for h3_cell in h3_cells:
-                partition_df = df[df["h3_level6"] == h3_cell][
-                    ["StateAbbr", "Tract", "geometry"]
-                ]
-
-                if len(partition_df) > 0:
-                    target_key = f"{self.target_prefix}{strategy_path}h3_level6={h3_cell}/hazus_tracts.parquet"
-                    target_url = f"s3://{self.target_bucket}/{target_key}"
-
-                    query_template = "COPY partition_data TO '{target_url}' (FORMAT PARQUET, COMPRESSION 'snappy');"
-
-                    partition_tasks.append(
-                        {
-                            "partition_data": partition_df,
-                            "query_template": query_template.format(
-                                target_url=target_url
-                            ),
-                            "target_url": target_url,
-                            "h3_cell": h3_cell,
-                            "row_count": len(partition_df),
-                        }
-                    )
-
+            # Get unique H3 cells for reporting
+            h3_cells = df[h3_column].unique()
             print(
-                f"   📊 Uploading {len(partition_tasks)} H3 partitions using {self.max_workers} parallel workers..."
+                f"   📊 Will create {len(h3_cells)} H3 hexagon partitions using Hive partitioning..."
             )
 
-            # Execute partitions in parallel
-            created_files = []
-            failed_files = []
+            # Register the DataFrame with DuckDB for partitioned write
+            self.conn.register(
+                "h3_partitioned_data", df[["StateAbbr", "Tract", "geometry", h3_column]]
+            )
 
-            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-                # Submit all tasks
-                future_to_task = {
-                    executor.submit(
-                        self._create_partition_worker,
-                        task["partition_data"],
-                        task["query_template"],
-                        task["target_url"],
-                    ): task
-                    for task in partition_tasks
-                }
+            print(f"   📁 Target path: {target_path}")
+            print("   🚀 Executing Hive partitioned write...")
 
-                # Process completed tasks
-                for future in as_completed(future_to_task):
-                    task = future_to_task[future]
-                    result = future.result()
+            # Use DuckDB's native Hive partitioning with PARTITION_BY
+            copy_query = f"""
+            COPY (
+                SELECT StateAbbr, Tract, geometry, {h3_column}
+                FROM h3_partitioned_data
+            ) TO '{target_path}' (
+                FORMAT PARQUET,
+                COMPRESSION 'snappy',
+                PARTITION_BY ({h3_column}),
+                OVERWRITE_OR_IGNORE
+            );
+            """
 
-                    if result["success"]:
-                        created_files.append(result["target_url"])
-                        if len(created_files) <= 5:  # Show first few
-                            print(
-                                f"      ✅ {task['h3_cell']}: {task['row_count']} tracts -> {result['target_url']}"
-                            )
-                        elif len(created_files) == 6:
-                            print(
-                                f"      ... (showing first 5, completing {len(partition_tasks)} total)"
-                            )
-                    else:
-                        failed_files.append(result)
-                        print(f"      ❌ {task['h3_cell']}: {result['error']}")
+            self.conn.execute(copy_query)
 
             duration = time.time() - start_time
-
-            if failed_files:
-                print(
-                    f"   ⚠️  Completed {len(created_files)} files, {len(failed_files)} failed in {duration:.2f}s"
-                )
-            else:
-                print(f"   ✅ Completed {len(created_files)} files in {duration:.2f}s")
+            print(f"   ✅ Completed Hive partitioning in {duration:.2f}s")
 
             return {
-                "strategy": "spatial_h3_l6",
-                "files_created": len(created_files),
-                "files_failed": len(failed_files),
+                "strategy": "spatial_h3_l3",
+                "partitioning_type": "hive",
+                "partition_column": h3_column,
                 "h3_level": h3_level,
-                "target_paths": created_files[:5],  # First 5 for brevity
+                "estimated_partitions": len(h3_cells),
+                "target_path": target_path,
                 "duration_seconds": duration,
             }
 
@@ -411,12 +273,13 @@ class PartitionCreator:
             return None
 
     def create_hybrid_state_h3_dataset(self):
-        """Strategy 4: Hybrid partitioning by StateAbbr then H3"""
-        print("🔄 Creating Hybrid State+H3 Dataset...")
+        """Strategy 4: Hybrid partitioning by StateAbbr then H3 using DuckDB Hive partitioning"""
+        print("🔄 Creating Hybrid State+H3 Dataset with Hive Partitioning...")
 
         strategy_config = self.config["partitioning_strategies"]["hybrid_state_h3"]
         strategy_path = strategy_config["path"]
         h3_level = strategy_config["h3_level"]
+        target_path = f"s3://{self.target_bucket}/{self.target_prefix}{strategy_path}"
 
         try:
             start_time = time.time()
@@ -425,7 +288,9 @@ class PartitionCreator:
             if not self._extract_centroid_coordinates():
                 return None
 
-            print(f"   🔢 Computing H3 level {h3_level} indices by state...")
+            print(
+                f"   🔢 Computing H3 level {h3_level} indices for hybrid partitioning..."
+            )
 
             # Get all data with coordinates and state info
             data_query = """
@@ -435,7 +300,10 @@ class PartitionCreator:
             df = self.conn.execute(data_query).df()
 
             # Add H3 indices
-            df["h3_level6"] = df.apply(
+            h3_column = f"h3_level{h3_level}"
+            print(f"   🔢 Computing {len(df):,} H3 level {h3_level} indices...")
+
+            df[h3_column] = df.apply(
                 lambda row: (
                     h3.geo_to_h3(row["latitude"], row["longitude"], h3_level)
                     if pd.notna(row["latitude"]) and pd.notna(row["longitude"])
@@ -445,89 +313,49 @@ class PartitionCreator:
             )
 
             # Filter out any records without valid H3 indices
-            df = df.dropna(subset=["h3_level6"])
+            df = df.dropna(subset=[h3_column])
+            print(f"   ✅ Generated {len(df):,} valid H3 indices")
 
-            # Group by state and H3 cell
-            partition_groups = df.groupby(["StateAbbr", "h3_level6"])
-            print(f"   📊 Creating {len(partition_groups)} hybrid partitions...")
-
-            # Prepare partition tasks
-            partition_tasks = []
-            for (state, h3_cell), group_df in partition_groups:
-                partition_df = group_df[["StateAbbr", "Tract", "geometry"]]
-
-                target_key = f"{self.target_prefix}{strategy_path}StateAbbr={state}/h3_level6={h3_cell}/hazus_tracts.parquet"
-                target_url = f"s3://{self.target_bucket}/{target_key}"
-
-                query_template = "COPY partition_data TO '{target_url}' (FORMAT PARQUET, COMPRESSION 'snappy');"
-
-                partition_tasks.append(
-                    {
-                        "partition_data": partition_df,
-                        "query_template": query_template.format(target_url=target_url),
-                        "target_url": target_url,
-                        "state": state,
-                        "h3_cell": h3_cell,
-                        "row_count": len(partition_df),
-                    }
-                )
-
+            # Get unique combinations for reporting
+            partition_groups = df.groupby(["StateAbbr", h3_column]).size()
             print(
-                f"   📊 Uploading {len(partition_tasks)} hybrid partitions using {self.max_workers} parallel workers..."
+                f"   📊 Will create {len(partition_groups)} hybrid partitions using Hive partitioning..."
             )
 
-            # Execute partitions in parallel
-            created_files = []
-            failed_files = []
+            # Register the DataFrame with DuckDB for partitioned write
+            self.conn.register(
+                "hybrid_partitioned_data",
+                df[["StateAbbr", "Tract", "geometry", h3_column]],
+            )
 
-            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-                # Submit all tasks
-                future_to_task = {
-                    executor.submit(
-                        self._create_partition_worker,
-                        task["partition_data"],
-                        task["query_template"],
-                        task["target_url"],
-                    ): task
-                    for task in partition_tasks
-                }
+            print(f"   📁 Target path: {target_path}")
+            print("   🚀 Executing Hive partitioned write...")
 
-                # Process completed tasks
-                for future in as_completed(future_to_task):
-                    task = future_to_task[future]
-                    result = future.result()
+            # Use DuckDB's native Hive partitioning with PARTITION_BY (multiple columns)
+            copy_query = f"""
+            COPY (
+                SELECT StateAbbr, Tract, geometry, {h3_column}
+                FROM hybrid_partitioned_data
+            ) TO '{target_path}' (
+                FORMAT PARQUET,
+                COMPRESSION 'snappy',
+                PARTITION_BY (StateAbbr, {h3_column}),
+                OVERWRITE_OR_IGNORE
+            );
+            """
 
-                    if result["success"]:
-                        created_files.append(result["target_url"])
-                        if len(created_files) <= 5:  # Show first few
-                            print(
-                                f"      ✅ {task['state']}/{task['h3_cell']}: {task['row_count']} tracts -> {result['target_url']}"
-                            )
-                        elif len(created_files) == 6:
-                            print(
-                                f"      ... (showing first 5, completing {len(partition_tasks)} total)"
-                            )
-                    else:
-                        failed_files.append(result)
-                        print(
-                            f"      ❌ {task['state']}/{task['h3_cell']}: {result['error']}"
-                        )
+            self.conn.execute(copy_query)
 
             duration = time.time() - start_time
-
-            if failed_files:
-                print(
-                    f"   ⚠️  Completed {len(created_files)} files, {len(failed_files)} failed in {duration:.2f}s"
-                )
-            else:
-                print(f"   ✅ Completed {len(created_files)} files in {duration:.2f}s")
+            print(f"   ✅ Completed Hive partitioning in {duration:.2f}s")
 
             return {
                 "strategy": "hybrid_state_h3",
-                "files_created": len(created_files),
-                "files_failed": len(failed_files),
+                "partitioning_type": "hive",
+                "partition_columns": ["StateAbbr", h3_column],
                 "h3_level": h3_level,
-                "target_paths": created_files[:5],  # First 5 for brevity
+                "estimated_partitions": len(partition_groups),
+                "target_path": target_path,
                 "duration_seconds": duration,
             }
 
@@ -545,7 +373,7 @@ class PartitionCreator:
         strategies = [
             ("no_partition", self.create_no_partition_dataset),
             ("attribute_state", self.create_attribute_state_dataset),
-            ("spatial_h3_l6", self.create_spatial_h3_dataset),
+            ("spatial_h3_l3", self.create_spatial_h3_dataset),
             ("hybrid_state_h3", self.create_hybrid_state_h3_dataset),
         ]
 
@@ -567,7 +395,7 @@ class PartitionCreator:
         strategy_methods = {
             "no_partition": self.create_no_partition_dataset,
             "attribute_state": self.create_attribute_state_dataset,
-            "spatial_h3_l6": self.create_spatial_h3_dataset,
+            "spatial_h3_l3": self.create_spatial_h3_dataset,
             "hybrid_state_h3": self.create_hybrid_state_h3_dataset,
         }
 
@@ -613,14 +441,11 @@ def main():
     )
     parser.add_argument(
         "--strategy",
-        choices=["no_partition", "attribute_state", "spatial_h3_l6", "hybrid_state_h3"],
+        choices=["no_partition", "attribute_state", "spatial_h3_l3", "hybrid_state_h3"],
         help="Run single strategy (default: run all)",
     )
     parser.add_argument(
         "--all-strategies", action="store_true", help="Run all partitioning strategies"
-    )
-    parser.add_argument(
-        "--workers", type=int, default=8, help="Number of parallel workers (default: 8)"
     )
 
     args = parser.parse_args()
@@ -629,7 +454,7 @@ def main():
     config = load_config()
 
     # Create partitioner
-    partitioner = PartitionCreator(config, max_workers=args.workers)
+    partitioner = PartitionCreator(config)
 
     # Run partitioning
     if args.strategy:

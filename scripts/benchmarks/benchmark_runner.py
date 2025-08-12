@@ -22,33 +22,34 @@ from scripts.analytics.analytical_queries import (
 
 def check_dataset_availability(runner: AnalyticalQueryRunner) -> dict:
     """Check which datasets are available for testing"""
-    strategies = ["no_partition", "attribute_state", "spatial_h3_l6", "hybrid_state_h3"]
+    strategies = ["no_partition", "attribute_state", "spatial_h3_l3", "hybrid_state_h3"]
     available = {}
 
     print("🔍 Checking dataset availability...")
 
     for strategy in strategies:
+        print(f"   🔍 Checking {strategy}...")
         try:
             dataset_path = runner._get_dataset_path(strategy)
 
-            # Try a simple count query to verify the dataset exists and is readable
-            test_query = f"SELECT COUNT(*) FROM '{dataset_path}' LIMIT 1;"
+            # Just check if we can read a single record - much faster than COUNT(*)
+            test_query = f"SELECT 1 FROM '{dataset_path}' LIMIT 1;"
             result = runner.conn.execute(test_query).fetchone()
 
-            if result and result[0] > 0:
+            if result:
                 available[strategy] = {
                     "status": "available",
                     "path": dataset_path,
-                    "record_count": result[0],
+                    "record_count": "unknown",  # Don't count for speed
                 }
-                print(f"   ✅ {strategy}: {result[0]:,} records")
+                print(f"      ✅ {strategy}: dataset available")
             else:
                 available[strategy] = {
                     "status": "empty",
                     "path": dataset_path,
                     "record_count": 0,
                 }
-                print(f"   ⚠️  {strategy}: dataset empty")
+                print(f"      ⚠️  {strategy}: dataset empty")
 
         except Exception as e:
             available[strategy] = {
@@ -56,7 +57,7 @@ def check_dataset_availability(runner: AnalyticalQueryRunner) -> dict:
                 "path": runner._get_dataset_path(strategy),
                 "error": str(e),
             }
-            print(f"   ❌ {strategy}: {str(e)[:100]}")
+            print(f"      ❌ {strategy}: {str(e)[:100]}")
 
     return available
 
@@ -234,7 +235,7 @@ def main():
     parser.add_argument(
         "--strategies",
         nargs="+",
-        choices=["no_partition", "attribute_state", "spatial_h3_l6", "hybrid_state_h3"],
+        choices=["no_partition", "attribute_state", "spatial_h3_l3", "hybrid_state_h3"],
         help="Specific strategies to test (default: all available)",
     )
 

@@ -19,7 +19,7 @@ def main():
     parser = argparse.ArgumentParser(description="Test individual analytical queries")
     parser.add_argument(
         "--strategy",
-        choices=["no_partition", "attribute_state", "spatial_h3_l6", "hybrid_state_h3"],
+        choices=["no_partition", "attribute_state", "spatial_h3_l3", "hybrid_state_h3"],
         required=True,
         help="Partitioning strategy to test",
     )

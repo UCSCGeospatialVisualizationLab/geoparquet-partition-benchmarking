@@ -318,7 +318,7 @@ def calculate_partition_estimates(analysis_results, config):
             print(f"      Size per file: ~{estimated_size_per_state:.1f} MB")
             print(f"      Target size: {target_size_mb} MB")
 
-        elif strategy_name == "spatial_h3_l6":
+        elif strategy_name == "spatial_h3_l3":
             # H3 Level 6 has ~4,992,676 hexagons globally, but we'll estimate based on target size
             estimated_files = int(total_size_mb / target_size_mb)
             records_per_file = total_records / estimated_files

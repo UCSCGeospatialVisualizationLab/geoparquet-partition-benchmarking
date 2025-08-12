@@ -1,0 +1,491 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DuckDB-WASM Client Performance Test</title>
+    
+    <!-- Import map to resolve bare module specifiers for DuckDB-WASM dependencies -->
+    <script type="importmap">
+    {
+        "imports": {
+            "apache-arrow": "https://cdn.jsdelivr.net/npm/apache-arrow@21.0.0/+esm"
+        }
+    }
+    </script>
+    
+    <script type="module">
+        // DuckDB-WASM will be loaded dynamically
+    </script>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            margin: 20px;
+            background-color: #f5f5f5;
+        }
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        .test-controls {
+            background: #f8f9fa;
+            padding: 15px;
+            border-radius: 5px;
+            margin-bottom: 20px;
+        }
+        .results-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+            gap: 15px;
+            margin-top: 20px;
+        }
+        .result-card {
+            background: white;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+            padding: 15px;
+        }
+        .result-card h3 {
+            margin: 0 0 10px 0;
+            color: #333;
+        }
+        .metric {
+            display: flex;
+            justify-content: space-between;
+            padding: 2px 0;
+        }
+        .metric-value {
+            font-weight: bold;
+            color: #007bff;
+        }
+        .sql-preview {
+            background: #f8f9fa;
+            border: 1px solid #e9ecef;
+            border-radius: 4px;
+            padding: 8px;
+            font-family: 'Courier New', monospace;
+            font-size: 12px;
+            margin: 8px 0;
+            max-height: 60px;
+            overflow: hidden;
+            position: relative;
+        }
+        .sql-preview:hover {
+            max-height: none;
+            overflow: visible;
+            z-index: 10;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+        }
+        .range-indicator {
+            display: inline-block;
+            background: #17a2b8;
+            color: white;
+            padding: 2px 6px;
+            border-radius: 10px;
+            font-size: 11px;
+            margin-left: 8px;
+        }
+        button {
+            background: #007bff;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 5px;
+            cursor: pointer;
+            margin-right: 10px;
+        }
+        button:hover {
+            background: #0056b3;
+        }
+        button:disabled {
+            background: #6c757d;
+            cursor: not-allowed;
+        }
+        .progress {
+            background: #e9ecef;
+            height: 20px;
+            border-radius: 10px;
+            overflow: hidden;
+            margin: 10px 0;
+        }
+        .progress-bar {
+            background: #007bff;
+            height: 100%;
+            transition: width 0.3s;
+        }
+        .status {
+            font-style: italic;
+            color: #666;
+            margin: 10px 0;
+        }
+        .error {
+            color: #dc3545;
+            font-weight: bold;
+        }
+        .bbox-info {
+            background: #e7f3ff;
+            padding: 10px;
+            border-radius: 5px;
+            margin-bottom: 15px;
+            font-size: 14px;
+        }
+        .duckdb-info {
+            background: #fff3cd;
+            padding: 10px;
+            border-radius: 5px;
+            margin-bottom: 15px;
+            font-size: 13px;
+            border-left: 4px solid #ffc107;
+        }
+        .query-type {
+            display: inline-block;
+            background: #6f42c1;
+            color: white;
+            padding: 2px 8px;
+            border-radius: 12px;
+            font-size: 12px;
+            margin-left: 10px;
+        }
+        .loading-spinner {
+            display: inline-block;
+            width: 16px;
+            height: 16px;
+            border: 2px solid #f3f3f3;
+            border-top: 2px solid #007bff;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            margin-right: 8px;
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>DuckDB-WASM Client Performance Test</h1>
+        <p>Testing SQL queries with HTTP range requests across 4 parquet partitioning strategies</p>
+        
+        <div class="bbox-info">
+            <strong>Test Region:</strong> California Bay Area<br>
+            <strong>Bounding Box:</strong> West: -122.6, South: 37.2, East: -121.8, North: 38.0
+        </div>
+
+        <div class="duckdb-info">
+            <strong>🦆 DuckDB-WASM:</strong> Server-side query execution with HTTP range requests for selective data access and spatial predicate pushdown.
+        </div>
+
+        <div class="test-controls">
+            <button onclick="runSingleTest('no_partition')" id="btn-no-partition">Test: No Partition</button>
+            <button onclick="runSingleTest('attribute_state')" id="btn-attribute-state">Test: State-Based</button>
+            <button onclick="runSingleTest('spatial_h3_l3')" id="btn-spatial-h3">Test: Spatial H3</button>
+            <button onclick="runSingleTest('hybrid_state_h3')" id="btn-hybrid">Test: Hybrid</button>
+            <button onclick="runAllTests()" id="btn-run-all">Run All Tests</button>
+            <button onclick="exportResults()" id="btn-export">Export Results</button>
+        </div>
+
+        <div class="progress" id="progress-container" style="display: none;">
+            <div class="progress-bar" id="progress-bar" style="width: 0%;"></div>
+        </div>
+        <div class="status" id="status"></div>
+
+        <div class="results-grid" id="results-grid">
+            <!-- Results will be populated here -->
+        </div>
+    </div>
+
+    <script type="module" src="js/range_metrics.js"></script>
+    <script type="module" src="js/duckdb_strategies.js"></script>
+    <script type="module" src="js/duckdb_loader.js"></script>
+    <script>
+        // Global test results storage
+        let testResults = {};
+        let duckdb = null;
+        let connection = null;
+        
+        const TEST_BBOX = {
+            west: -122.6,
+            south: 37.2,
+            east: -121.8,
+            north: 38.0
+        };
+
+        const BASE_URL = 'https://s3-west.nrp-nautilus.io/vizlab-geodatalake-exports/hazus-performance-test';
+
+        // Main test orchestration
+        async function runSingleTest(strategy) {
+            updateStatus(`Running DuckDB ${strategy} test...`);
+            disableButtons();
+            showProgress();
+            
+            try {
+                const result = await testDuckDBStrategy(strategy, TEST_BBOX);
+                testResults[strategy] = result;
+                displayResult(strategy, result);
+                updateStatus(`${strategy} DuckDB test completed successfully`);
+            } catch (error) {
+                updateStatus(`${strategy} test failed: ${error.message}`, true);
+                console.error(`Test ${strategy} error:`, error);
+            }
+            
+            hideProgress();
+            enableButtons();
+        }
+
+        async function runAllTests() {
+            updateStatus('Running all DuckDB SQL tests...');
+            disableButtons();
+            showProgress();
+            
+            const strategies = ['no_partition', 'attribute_state', 'spatial_h3_l3', 'hybrid_state_h3'];
+            let completed = 0;
+            
+            for (const strategy of strategies) {
+                try {
+                    updateStatus(`Querying ${strategy}... (${completed + 1}/${strategies.length})`);
+                    updateProgress((completed / strategies.length) * 100);
+                    
+                    const result = await testDuckDBStrategy(strategy, TEST_BBOX);
+                    testResults[strategy] = result;
+                    displayResult(strategy, result);
+                    completed++;
+                } catch (error) {
+                    updateStatus(`${strategy} failed: ${error.message}`, true);
+                    console.error(`Test ${strategy} error:`, error);
+                }
+            }
+            
+            updateProgress(100);
+            updateStatus(`All DuckDB tests completed (${completed}/${strategies.length} successful)`);
+            hideProgress();
+            enableButtons();
+        }
+
+        function displayResult(strategy, result) {
+            const resultsGrid = document.getElementById('results-grid');
+            
+            // Remove existing result if any
+            const existingCard = document.getElementById(`result-${strategy}`);
+            if (existingCard) {
+                existingCard.remove();
+            }
+            
+            const card = document.createElement('div');
+            card.className = 'result-card';
+            card.id = `result-${strategy}`;
+            
+            card.innerHTML = `
+                <h3>${formatStrategyName(strategy)}</h3>
+                <div class="sql-preview">${result.sqlQuery}</div>
+                <div class="metric">
+                    <span>Query Time:</span>
+                    <span class="metric-value">${result.queryTime.toFixed(2)}ms<span class="query-type">${result.queryType}</span></span>
+                </div>
+                <div class="metric">
+                    <span>HTTP Requests:</span>
+                    <span class="metric-value">${result.httpRequestCount}<span class="range-indicator">${result.rangeRequests} ranges</span></span>
+                </div>
+                <div class="metric">
+                    <span>Bytes Transferred:</span>
+                    <span class="metric-value">${formatBytes(result.bytesTransferred)}</span>
+                </div>
+                <div class="metric">
+                    <span>Rows Returned:</span>
+                    <span class="metric-value">${result.rowsReturned.toLocaleString()}</span>
+                </div>
+                <div class="metric">
+                    <span>Connection Time:</span>
+                    <span class="metric-value">${result.connectionTime.toFixed(2)}ms</span>
+                </div>
+                <div class="metric">
+                    <span>Query Efficiency:</span>
+                    <span class="metric-value">${result.queryEfficiency.toFixed(1)}%</span>
+                </div>
+                <div class="metric">
+                    <span>Pushdown Success:</span>
+                    <span class="metric-value">${result.predicatePushdown ? '✅ Yes' : '❌ No'}</span>
+                </div>
+                <div class="metric">
+                    <span>Transfer Rate:</span>
+                    <span class="metric-value">${(result.bytesTransferred / result.queryTime * 1000 / 1024 / 1024).toFixed(2)} MB/s</span>
+                </div>
+            `;
+            
+            resultsGrid.appendChild(card);
+        }
+
+        function exportResults() {
+            const resultsJson = JSON.stringify({
+                testConfig: {
+                    bbox: TEST_BBOX,
+                    timestamp: new Date().toISOString(),
+                    userAgent: navigator.userAgent,
+                    duckdbVersion: duckdb?.version || '1.29.0',
+                    testType: 'duckdb_wasm_range_requests'
+                },
+                results: testResults
+            }, null, 2);
+            
+            const blob = new Blob([resultsJson], { type: 'application/json' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `duckdb_client_results_${new Date().toISOString().slice(0,19).replace(/:/g, '')}.json`;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+            
+            updateStatus('DuckDB results exported successfully');
+        }
+
+        // UI helper functions
+        function updateStatus(message, isError = false) {
+            const status = document.getElementById('status');
+            if (isError) {
+                status.innerHTML = `<span class="error">${message}</span>`;
+            } else if (message.includes('Querying')) {
+                status.innerHTML = `<span class="loading-spinner"></span>${message}`;
+            } else {
+                status.textContent = message;
+            }
+            status.className = isError ? 'status error' : 'status';
+        }
+
+        function showProgress() {
+            document.getElementById('progress-container').style.display = 'block';
+        }
+
+        function hideProgress() {
+            document.getElementById('progress-container').style.display = 'none';
+        }
+
+        function updateProgress(percentage) {
+            document.getElementById('progress-bar').style.width = `${percentage}%`;
+        }
+
+        function disableButtons() {
+            const buttons = document.querySelectorAll('button');
+            buttons.forEach(btn => btn.disabled = true);
+        }
+
+        function enableButtons() {
+            const buttons = document.querySelectorAll('button');
+            buttons.forEach(btn => btn.disabled = false);
+        }
+
+        function formatStrategyName(strategy) {
+            const names = {
+                'no_partition': 'No Partition (Range Requests)',
+                'attribute_state': 'Attribute-Based (State)',
+                'spatial_h3_l3': 'Spatial H3 Grid',
+                'hybrid_state_h3': 'Hybrid State+H3'
+            };
+            return names[strategy] || strategy;
+        }
+
+        function formatBytes(bytes) {
+            if (bytes === 0) return '0 B';
+            const k = 1024;
+            const sizes = ['B', 'KB', 'MB', 'GB'];
+            const i = Math.floor(Math.log(bytes) / Math.log(k));
+            return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+        }
+
+        // Initialize DuckDB-WASM
+        async function initializeDuckDB() {
+            try {
+                updateStatus('Initializing DuckDB-WASM...');
+                
+                let duckdbModule;
+                try {
+                    // Try esm.sh CDN first (better for complex modules)
+                    duckdbModule = await import('https://esm.sh/@duckdb/duckdb-wasm@1.29.0');
+                } catch (cdnError) {
+                    console.warn('CDN loading failed, trying local files:', cdnError);
+                    // Fallback to local files served over HTTP
+                    duckdbModule = await import('./js/duckdb-wasm/duckdb-browser.mjs');
+                }
+                console.log('DuckDB module loaded:', Object.keys(duckdbModule));
+                
+                // Use local DuckDB-WASM files to avoid CORS issues with Workers
+                // Following the official documentation pattern with absolute paths from server root
+                const MANUAL_BUNDLES = {
+                    mvp: {
+                        mainModule: '/js/duckdb-wasm/duckdb-mvp.wasm',
+                        mainWorker: '/js/duckdb-wasm/duckdb-browser-mvp.worker.js',
+                    },
+                    eh: {
+                        mainModule: '/js/duckdb-wasm/duckdb-eh.wasm',
+                        mainWorker: '/js/duckdb-wasm/duckdb-browser-eh.worker.js',
+                    },
+                };
+                
+                console.log('Using local DuckDB-WASM bundles...');
+                
+                // Select a bundle based on browser checks
+                const bundle = await duckdbModule.selectBundle(MANUAL_BUNDLES);
+                console.log('Selected bundle:', bundle);
+                
+                // Instantiate the asynchronous version of DuckDB-Wasm with local files
+                const worker = new Worker(bundle.mainWorker);
+                const logger = new duckdbModule.ConsoleLogger();
+                
+                duckdb = new duckdbModule.AsyncDuckDB(logger, worker);
+                await duckdb.instantiate(bundle.mainModule, bundle.pthreadWorker);
+                
+                // Store globally for cleanup and access
+                window.duckdb = duckdb;
+                
+                // Get connection and store it globally for the loader
+                connection = await duckdb.connect();
+                window.connection = connection; // Make it available to duckdb_loader.js
+                
+                // Install and load HTTPFS extension
+                await connection.query(`INSTALL httpfs;`);
+                await connection.query(`LOAD httpfs;`);
+                
+                // Configure S3 settings
+                await connection.query(`SET s3_region='us-west-1';`);
+                await connection.query(`SET s3_endpoint='s3-west.nrp-nautilus.io';`);
+                await connection.query(`SET s3_url_style='path';`);
+                await connection.query(`SET s3_use_ssl=true;`);
+                
+                // Install and load spatial extension for geospatial queries
+                await connection.query(`INSTALL spatial;`);
+                await connection.query(`LOAD spatial;`);
+                
+                // Configure HTTP settings for range requests
+                await connection.query(`SET http_timeout=30000;`);
+                await connection.query(`SET http_retries=3;`);
+                
+                // Test the connection with a simple query
+                const testResult = await connection.query('SELECT 1 as test');
+                console.log('Connection test successful:', testResult);
+                
+                console.log('DuckDB-WASM initialized successfully with all extensions');
+                updateStatus('Ready to run DuckDB SQL tests');
+                return true;
+                
+            } catch (error) {
+                console.error('DuckDB initialization failed:', error);
+                updateStatus(`Error: DuckDB initialization failed - ${error.message}`, true);
+                return false;
+            }
+        }
+
+        // Initialize page
+        document.addEventListener('DOMContentLoaded', async function() {
+            const initialized = await initializeDuckDB();
+            if (!initialized) {
+                disableButtons();
+            }
+        });
+    </script>
+</body>
+</html>

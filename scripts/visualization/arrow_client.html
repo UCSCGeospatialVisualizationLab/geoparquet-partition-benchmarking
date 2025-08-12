@@ -1,0 +1,394 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Arrow.js Client Performance Test</title>
+    <script src="https://cdn.jsdelivr.net/npm/apache-arrow@21.0.0"></script>
+    <!-- parquet-wasm will be loaded via CDN -->
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            margin: 20px;
+            background-color: #f5f5f5;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        .test-controls {
+            background: #f8f9fa;
+            padding: 15px;
+            border-radius: 5px;
+            margin-bottom: 20px;
+        }
+        .results-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 15px;
+            margin-top: 20px;
+        }
+        .result-card {
+            background: white;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+            padding: 15px;
+        }
+        .result-card h3 {
+            margin: 0 0 10px 0;
+            color: #333;
+        }
+        .result-card.skipped {
+            border-color: #ffc107;
+            background: linear-gradient(135deg, #fff9e6 0%, #fffbf0 100%);
+        }
+        .skip-notice {
+            text-align: center;
+            margin: 15px 0 20px 0;
+            padding: 15px;
+            background: #fff3cd;
+            border: 1px solid #ffc107;
+            border-radius: 5px;
+        }
+        .skip-icon {
+            font-size: 24px;
+            margin-bottom: 8px;
+        }
+        .skip-title {
+            font-weight: bold;
+            font-size: 16px;
+            color: #856404;
+            margin-bottom: 5px;
+        }
+        .skip-reason {
+            color: #856404;
+            font-style: italic;
+        }
+        .skip-details {
+            border-top: 1px solid #ffc107;
+            padding-top: 15px;
+            margin-top: 15px;
+        }
+        .skip-details .metric-value {
+            color: #856404;
+            font-size: 12px;
+        }
+        .metric {
+            display: flex;
+            justify-content: space-between;
+            padding: 2px 0;
+        }
+        .metric-value {
+            font-weight: bold;
+            color: #007bff;
+        }
+        button {
+            background: #007bff;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 5px;
+            cursor: pointer;
+            margin-right: 10px;
+        }
+        button:hover {
+            background: #0056b3;
+        }
+        button:disabled {
+            background: #6c757d;
+            cursor: not-allowed;
+        }
+        .progress {
+            background: #e9ecef;
+            height: 20px;
+            border-radius: 10px;
+            overflow: hidden;
+            margin: 10px 0;
+        }
+        .progress-bar {
+            background: #28a745;
+            height: 100%;
+            transition: width 0.3s;
+        }
+        .status {
+            font-style: italic;
+            color: #666;
+            margin: 10px 0;
+        }
+        .error {
+            color: #dc3545;
+            font-weight: bold;
+        }
+        .bbox-info {
+            background: #e7f3ff;
+            padding: 10px;
+            border-radius: 5px;
+            margin-bottom: 15px;
+            font-size: 14px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Arrow.js Client Performance Test</h1>
+        <p>Testing selective spatial loading across 4 parquet partitioning strategies</p>
+        
+        <div class="bbox-info">
+            <strong>Test Region:</strong> California Bay Area<br>
+            <strong>Bounding Box:</strong> West: -122.6, South: 37.2, East: -121.8, North: 38.0
+        </div>
+
+        <div class="test-controls">
+            <button onclick="runSingleTest('no_partition')" id="btn-no-partition">Test: No Partition</button>
+            <button onclick="runSingleTest('attribute_state')" id="btn-attribute-state">Test: State-Based</button>
+            <button onclick="runSingleTest('spatial_h3_l3')" id="btn-spatial-h3">Test: Spatial H3</button>
+            <button onclick="runSingleTest('hybrid_state_h3')" id="btn-hybrid">Test: Hybrid</button>
+            <button onclick="runAllTests()" id="btn-run-all">Run All Tests</button>
+            <button onclick="exportResults()" id="btn-export">Export Results</button>
+        </div>
+
+        <div class="progress" id="progress-container" style="display: none;">
+            <div class="progress-bar" id="progress-bar" style="width: 0%;"></div>
+        </div>
+        <div class="status" id="status"></div>
+
+        <div class="results-grid" id="results-grid">
+            <!-- Results will be populated here -->
+        </div>
+    </div>
+
+    <script src="js/performance_metrics.js"></script>
+    <script src="js/partition_strategies.js"></script>
+    <script src="js/arrow_loader.js"></script>
+    <script>
+        // Global test results storage
+        let testResults = {};
+        const TEST_BBOX = {
+            west: -122.6,
+            south: 37.2,
+            east: -121.8,
+            north: 38.0
+        };
+
+        const BASE_URL = 'https://s3-west.nrp-nautilus.io/vizlab-geodatalake-exports/hazus-performance-test';
+
+        // Main test orchestration
+        async function runSingleTest(strategy) {
+            updateStatus(`Running ${strategy} test...`);
+            disableButtons();
+            showProgress();
+            
+            try {
+                const result = await testPartitionStrategy(strategy, TEST_BBOX);
+                testResults[strategy] = result;
+                displayResult(strategy, result);
+                updateStatus(`${strategy} test completed successfully`);
+            } catch (error) {
+                updateStatus(`${strategy} test failed: ${error.message}`, true);
+                console.error(`Test ${strategy} error:`, error);
+            }
+            
+            hideProgress();
+            enableButtons();
+        }
+
+        async function runAllTests() {
+            updateStatus('Running all partition strategy tests...');
+            disableButtons();
+            showProgress();
+            
+            const strategies = ['no_partition', 'attribute_state', 'spatial_h3_l3', 'hybrid_state_h3'];
+            let completed = 0;
+            
+            for (const strategy of strategies) {
+                try {
+                    updateStatus(`Testing ${strategy}... (${completed + 1}/${strategies.length})`);
+                    updateProgress((completed / strategies.length) * 100);
+                    
+                    const result = await testPartitionStrategy(strategy, TEST_BBOX);
+                    testResults[strategy] = result;
+                    displayResult(strategy, result);
+                    completed++;
+                } catch (error) {
+                    updateStatus(`${strategy} failed: ${error.message}`, true);
+                    console.error(`Test ${strategy} error:`, error);
+                }
+            }
+            
+            updateProgress(100);
+            updateStatus(`All tests completed (${completed}/${strategies.length} successful)`);
+            hideProgress();
+            enableButtons();
+        }
+
+        function displayResult(strategy, result) {
+            const resultsGrid = document.getElementById('results-grid');
+            
+            // Remove existing result if any
+            const existingCard = document.getElementById(`result-${strategy}`);
+            if (existingCard) {
+                existingCard.remove();
+            }
+            
+            const card = document.createElement('div');
+            card.className = 'result-card';
+            card.id = `result-${strategy}`;
+            
+            // Handle skipped tests
+            if (result.skipped) {
+                card.className += ' skipped';
+                card.innerHTML = `
+                    <h3>${formatStrategyName(strategy)}</h3>
+                    <div class="skip-notice">
+                        <div class="skip-icon">⚠️</div>
+                        <div class="skip-title">Test Skipped</div>
+                        <div class="skip-reason">${result.reason}</div>
+                    </div>
+                    <div class="skip-details">
+                        <div class="metric">
+                            <span>File Size:</span>
+                            <span class="metric-value">${result.details.fileSize}</span>
+                        </div>
+                        <div class="metric">
+                            <span>Limitation:</span>
+                            <span class="metric-value">${result.details.limitation}</span>
+                        </div>
+                        <div class="metric">
+                            <span>Recommendation:</span>
+                            <span class="metric-value">${result.details.recommendation}</span>
+                        </div>
+                    </div>
+                `;
+            } else {
+                // Handle normal test results
+                card.innerHTML = `
+                    <h3>${formatStrategyName(strategy)}</h3>
+                    <div class="metric">
+                        <span>Total Time:</span>
+                        <span class="metric-value">${result.totalTime.toFixed(2)}ms</span>
+                    </div>
+                    <div class="metric">
+                        <span>HTTP Requests:</span>
+                        <span class="metric-value">${result.httpRequestCount}</span>
+                    </div>
+                    <div class="metric">
+                        <span>Bytes Downloaded:</span>
+                        <span class="metric-value">${formatBytes(result.totalBytesDownloaded)}</span>
+                    </div>
+                    <div class="metric">
+                        <span>Arrow Parse Time:</span>
+                        <span class="metric-value">${result.arrowParseTime.toFixed(2)}ms</span>
+                    </div>
+                    <div class="metric">
+                        <span>Rows Extracted:</span>
+                        <span class="metric-value">${result.rowsExtracted.toLocaleString()}</span>
+                    </div>
+                    <div class="metric">
+                        <span>Avg TTFB:</span>
+                        <span class="metric-value">${result.avgTTFB.toFixed(2)}ms</span>
+                    </div>
+                    <div class="metric">
+                        <span>Memory Peak:</span>
+                        <span class="metric-value">${formatBytes(result.memoryPeak)}</span>
+                    </div>
+                    <div class="metric">
+                        <span>Efficiency:</span>
+                        <span class="metric-value">${(result.rowsExtracted / result.totalBytesDownloaded * 1000).toFixed(2)} rows/KB</span>
+                    </div>
+                `;
+            }
+            
+            resultsGrid.appendChild(card);
+        }
+
+        function exportResults() {
+            const resultsJson = JSON.stringify({
+                testConfig: {
+                    bbox: TEST_BBOX,
+                    timestamp: new Date().toISOString(),
+                    userAgent: navigator.userAgent,
+                    arrowVersion: Arrow.version || '21.0.0'
+                },
+                results: testResults
+            }, null, 2);
+            
+            const blob = new Blob([resultsJson], { type: 'application/json' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `arrow_client_results_${new Date().toISOString().slice(0,19).replace(/:/g, '')}.json`;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+            
+            updateStatus('Results exported successfully');
+        }
+
+        // UI helper functions
+        function updateStatus(message, isError = false) {
+            const status = document.getElementById('status');
+            status.textContent = message;
+            status.className = isError ? 'status error' : 'status';
+        }
+
+        function showProgress() {
+            document.getElementById('progress-container').style.display = 'block';
+        }
+
+        function hideProgress() {
+            document.getElementById('progress-container').style.display = 'none';
+        }
+
+        function updateProgress(percentage) {
+            document.getElementById('progress-bar').style.width = `${percentage}%`;
+        }
+
+        function disableButtons() {
+            const buttons = document.querySelectorAll('button');
+            buttons.forEach(btn => btn.disabled = true);
+        }
+
+        function enableButtons() {
+            const buttons = document.querySelectorAll('button');
+            buttons.forEach(btn => btn.disabled = false);
+        }
+
+        function formatStrategyName(strategy) {
+            const names = {
+                'no_partition': 'No Partition (Streaming)',
+                'attribute_state': 'Attribute-Based (State)',
+                'spatial_h3_l3': 'Spatial H3 Grid',
+                'hybrid_state_h3': 'Hybrid State+H3'
+            };
+            return names[strategy] || strategy;
+        }
+
+        function formatBytes(bytes) {
+            if (bytes === 0) return '0 B';
+            const k = 1024;
+            const sizes = ['B', 'KB', 'MB', 'GB'];
+            const i = Math.floor(Math.log(bytes) / Math.log(k));
+            return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+        }
+
+        // Initialize page
+        document.addEventListener('DOMContentLoaded', function() {
+            updateStatus('Ready to run performance tests');
+            // Check what Arrow globals are available
+            console.log('Available globals:', Object.keys(window).filter(k => k.includes('Arrow') || k.includes('arrow')));
+            if (typeof Arrow !== 'undefined') {
+                console.log('Arrow.js library loaded successfully');
+                console.log('Arrow version:', Arrow.version || 'unknown');
+            } else {
+                console.error('Arrow.js library failed to load');
+                updateStatus('Error: Arrow.js library failed to load', true);
+            }
+        });
+    </script>
+</body>
+</html>
