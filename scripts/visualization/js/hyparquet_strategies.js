@@ -142,17 +142,7 @@ const HyparquetStrategies = {
                 batchesProcessed = real.batchesProcessed || 0;
                 earlyTermination = real.earlyTermination || false;
             } else {
-                // Fallback to simulated streaming if real reader not available
-                const simulated = await simulateHyparquetStreaming(url, {
-                    targetRows,
-                    maxRowGroups,
-                    chunkSize: 64 * 1024
-                });
-                totalBytesStreamed = simulated.totalBytesRead;
-                rowsCollected = simulated.rowsCollected;
-                rowGroupsProcessed = simulated.rowGroupsProcessed;
-                batchesProcessed = Math.max(1, Math.ceil(simulated.rowsCollected / 500));
-                earlyTermination = simulated.earlyTermination;
+                throw new Error('Hyparquet reader not available');
             }
         } catch (error) {
             streamingMetrics.recordStreamingEvent('stream_error', `Stream failed: ${error.message}`, { url, error: error.message });
@@ -172,34 +162,13 @@ const HyparquetStrategies = {
             rowGroupsProcessed,
             batchesProcessed,
             earlyTermination,
-            streamEfficiency: earlyTermination ? ((rowsCollected / targetRows) * 100) : 100,
+            streamEfficiency: Math.min(100, (rowsCollected / targetRows) * 100),
             dataTransferRate: totalBytesStreamed / streamDuration * 1000, // bytes per second
             timestamp: new Date().toISOString()
         };
 
         console.log(`Hyparquet stream completed: ${description}`, result);
         return result;
-    },
-
-    /**
-     * Process a stream chunk using mock Hyparquet-like behavior
-     * In a real implementation, this would use actual Hyparquet APIs
-     */
-    async _processStreamChunk(chunkData, bbox, batchIndex) {
-        // Simulate processing time based on chunk size
-        const processingDelay = Math.min(chunkData.length / 1024 / 1024 * 10, 50); // 10ms per MB, max 50ms
-        await new Promise(resolve => setTimeout(resolve, processingDelay));
-
-        // Simulate row processing
-        const estimatedRows = Math.floor(chunkData.length / 200); // ~200 bytes per row estimate
-        const bayAreaRows = Math.floor(estimatedRows * 0.15); // ~15% in Bay Area (higher than 10% for CA filter)
-
-        return {
-            rowsInBatch: estimatedRows,
-            filteredRows: bayAreaRows,
-            processingTime: processingDelay,
-            chunkSize: chunkData.length
-        };
     },
 
     /**
@@ -248,16 +217,6 @@ const StreamingBboxUtils = {
     isInStreamingBbox(lon, lat, bbox) {
         return lon >= bbox.west && lon <= bbox.east && 
                lat >= bbox.south && lat <= bbox.north;
-    },
-
-    /**
-     * Estimate if a chunk likely contains Bay Area data
-     * Used for streaming optimization decisions
-     */
-    chunkLikelyContainsBayAreaData(chunkMetadata) {
-        // In a real implementation, this would check row group metadata
-        // For testing, we'll simulate based on chunk position and size
-        return Math.random() > 0.7; // 30% of chunks likely contain Bay Area data
     }
 };
 

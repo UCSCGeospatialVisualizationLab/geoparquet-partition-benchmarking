@@ -47,7 +47,7 @@ async function testPartitionStrategy(strategy, bbox) {
         perfMetrics.takeMemorySnapshot('data_filtered');
         
         // Step 4: Combine results and generate final metrics
-        const combinedTable = combineArrowTables(filteredTables);
+        combineArrowTables(filteredTables);
         perfMetrics.takeMemorySnapshot('data_combined');
         
         // Generate performance report

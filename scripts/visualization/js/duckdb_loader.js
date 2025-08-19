@@ -184,37 +184,6 @@ function mergeDuckDBResults(queryResults, performanceMetrics, strategy) {
 }
 
 /**
- * Advanced query optimization for different strategies
- */
-async function optimizeQueryForStrategy(strategy, sql, connection) {
-    const config = DuckDBStrategies.getStrategyConfig(strategy);
-    
-    // Strategy-specific optimizations
-    switch (strategy) {
-        case 'no_partition':
-            // Enable aggressive range requests for large file
-            await connection.query(`SET http_keep_alive=true;`);
-            await connection.query(`SET threads=4;`);
-            break;
-            
-        case 'attribute_state':
-            // Simple query on small file
-            await connection.query(`SET threads=1;`);
-            break;
-            
-        case 'spatial_h3_l3':
-        case 'hybrid_state_h3':
-            // Parallel processing for multiple files
-            await connection.query(`SET threads=4;`);
-            await connection.query(`SET max_memory='2GB';`);
-            break;
-    }
-    
-    rangeMetrics.recordQueryEvent('query_optimized', `Applied ${strategy} optimizations`, config);
-    return sql;
-}
-
-/**
  * Query result validator
  */
 function validateQueryResults(result, strategy, expectedRowRange) {

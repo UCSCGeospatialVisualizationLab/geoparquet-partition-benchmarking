@@ -286,26 +286,59 @@ function toUint8(value) {
 // Try to discover geometry accessors from various hyparquet result shapes
 function getGeometryAccessors(result) {
     if (!result) return null;
+    // Case 0: Apache Arrow Table-like
+    try {
+        const isArrowTable = (typeof result.numRows === 'number') && (typeof result.getChild === 'function' || typeof result.getColumn === 'function');
+        if (isArrowTable) {
+            const getVec = (name) => (typeof result.getChild === 'function' ? result.getChild(name) : (typeof result.getColumn === 'function' ? result.getColumn(name) : null));
+            const geomKeyCandidates = ['geometry', 'GEOMETRY', 'geom', 'GEOM'];
+            let vec = null;
+            for (const k of geomKeyCandidates) { vec = getVec(k); if (vec) break; }
+            // Heuristic: scan columns by index if names are unknown
+            if (!vec && typeof result.getChildAt === 'function' && result.schema && Array.isArray(result.schema.fields)) {
+                for (let i = 0; i < result.schema.fields.length; i++) {
+                    const v = result.getChildAt(i);
+                    if (v && typeof v.get === 'function') {
+                        const sample = v.get(0);
+                        if (toUint8(sample)) { vec = v; break; }
+                    }
+                }
+            }
+            if (vec && typeof vec.get === 'function') {
+                const length = result.numRows || (typeof vec.length === 'number' ? vec.length : 0);
+                return { length, getGeomAt: (i) => toUint8(vec.get(i)) };
+            }
+        }
+    } catch (_) { /* ignore */ }
     // Case 1: columnar: result.columns.{geometry}
-    const cols = result.columns || null;
+    const cols = result.columns || result.cols || null;
     const geomKeyCandidates = ['geometry', 'GEOMETRY', 'geom', 'GEOM'];
-    if (cols && typeof cols === 'object') {
-        let key = geomKeyCandidates.find(k => cols[k]);
+    if (cols && (typeof cols === 'object' || cols instanceof Map)) {
+        const getColByKey = (k) => (cols instanceof Map ? cols.get(k) : cols[k]);
+        let key = geomKeyCandidates.find(k => !!getColByKey(k));
         if (!key) {
             // Heuristic: find first binary-like column
-            key = Object.keys(cols).find(k => {
-                const col = cols[k];
-                const sample = Array.isArray(col) ? col[0] : (col && col[0]);
+            const keys = cols instanceof Map ? Array.from(cols.keys()) : Object.keys(cols);
+            key = keys.find(k => {
+                const col = getColByKey(k);
+                if (!col) return false;
+                let sample = undefined;
+                if (Array.isArray(col)) sample = col[0];
+                else if (typeof col.get === 'function') sample = col.get(0);
+                else if (col && col[0] !== undefined) sample = col[0];
                 const u8 = toUint8(sample);
                 return !!u8;
             });
         }
         if (key) {
-            const column = cols[key];
-            const length = column.length || 0;
+            const column = getColByKey(key);
+            const length = (column && typeof column.length === 'number') ? column.length : (typeof column.get === 'function' ? (column.length ?? 0) : 0);
             return {
                 length,
-                getGeomAt: (i) => toUint8(column[i])
+                getGeomAt: (i) => {
+                    const val = (column && typeof column.get === 'function') ? column.get(i) : column[i];
+                    return toUint8(val);
+                }
             };
         }
     }
@@ -327,6 +360,16 @@ function getGeometryAccessors(result) {
                 return key ? toUint8(row[key]) : null;
             }
         };
+    }
+    // Case 4: iterable table/vectors
+    if (result && typeof result[Symbol.iterator] === 'function' && !Array.isArray(result)) {
+        try {
+            const cache = Array.from(result);
+            const key = geomKeyCandidates.find(k => cache[0] && cache[0][k] != null);
+            if (key) {
+                return { length: cache.length, getGeomAt: (i) => toUint8(cache[i][key]) };
+            }
+        } catch (_) {}
     }
     return null;
 }
@@ -379,6 +422,7 @@ async function hyparquetReadWithBbox(url, bbox, { targetRows, maxRowGroups }) {
     const openStart = performance.now();
     let reader = null;
     let usedFallbackFullRead = false;
+    let totalBytesStreamed = 0;
 
     // Attempt to read via parquetRead using AsyncBuffer (preferred)
     let table = null;
@@ -407,6 +451,7 @@ async function hyparquetReadWithBbox(url, bbox, { targetRows, maxRowGroups }) {
             const resp = await fetch(url);
             if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
             const fullBuf = new Uint8Array(await resp.arrayBuffer());
+            totalBytesStreamed = fullBuf.byteLength;
             const baseOffset = fullBuf.byteOffset;
             const backing = fullBuf.buffer;
             const memAsyncBuffer = {
@@ -465,7 +510,6 @@ async function hyparquetReadWithBbox(url, bbox, { targetRows, maxRowGroups }) {
         fallback: usedFallbackFullRead,
     });
 
-    let totalBytesStreamed = 0; // Not easily measurable without hooking internal IO
     let rowsCollected = 0;
     let rowGroupsProcessed = 0;
     let batchesProcessed = 0;
@@ -488,6 +532,7 @@ async function hyparquetReadWithBbox(url, bbox, { targetRows, maxRowGroups }) {
         let inBatch = 0;
         const batchStart = performance.now();
         if (acc && acc.length) {
+            // Simulate batches from table rows to surface progress in UI
             for (let i = 0; i < acc.length; i++) {
                 const geom = acc.getGeomAt(i);
                 if (!firstBatchRecorded) { streamingMetrics.recordFirstBatch(); firstBatchRecorded = true; }
@@ -508,7 +553,8 @@ async function hyparquetReadWithBbox(url, bbox, { targetRows, maxRowGroups }) {
                 streamingMetrics.recordRowGroupBatch(batchesProcessed, inBatch, batchStart, performance.now(), { filteredRows: rowsCollected, url });
                 batchesProcessed++;
             }
-            rowGroupsProcessed = Math.max(rowGroupsProcessed, 1);
+            // Surface a pseudo row-group count based on batches to avoid zero RGs in UI
+            rowGroupsProcessed = Math.max(rowGroupsProcessed, Math.max(1, batchesProcessed));
         }
         return { totalBytesStreamed, rowsCollected, rowGroupsProcessed, batchesProcessed, earlyTermination: rowsCollected >= targetRows };
     }
@@ -516,11 +562,28 @@ async function hyparquetReadWithBbox(url, bbox, { targetRows, maxRowGroups }) {
     // Path 2: Iterate row groups via reader
     let rowGroupCount = 0;
     try {
-        rowGroupCount = (reader.getRowGroupCount && reader.getRowGroupCount()) || (reader.rowGroups && reader.rowGroups.length) || 0;
+        rowGroupCount =
+            (reader.getRowGroupCount && reader.getRowGroupCount()) ||
+            (reader.rowGroups && reader.rowGroups.length) ||
+            (reader.metadata && reader.metadata.row_groups && reader.metadata.row_groups.length) ||
+            (reader.getRowGroups && Array.isArray(reader.getRowGroups()) && reader.getRowGroups().length) ||
+            0;
     } catch (e) {
         rowGroupCount = 0;
     }
     if (!rowGroupCount) {
+        // Try to materialize a table from the reader if possible
+        if (!table) {
+            try {
+                if (reader && reader.readTable) {
+                    table = await reader.readTable({ columns: ['StateAbbr', 'Tract', 'geometry'] });
+                } else if (reader && reader.readAll) {
+                    table = await reader.readAll({ columns: ['StateAbbr', 'Tract', 'geometry'] });
+                }
+            } catch (e) {
+                streamingMetrics.recordStreamingEvent('hyparquet_read_error', 'Reader table materialization failed', { error: e.message });
+            }
+        }
         // Fallback: try reading via table path (we may already have table)
         if (table) {
             if (!firstBatchRecorded) { streamingMetrics.recordFirstBatch(); firstBatchRecorded = true; }
@@ -581,6 +644,9 @@ async function hyparquetReadWithBbox(url, bbox, { targetRows, maxRowGroups }) {
                 rgData = await reader.read({ rowGroup: rg, columns: ['StateAbbr', 'Tract', 'geometry'] });
             } else if (reader.getRowGroup) {
                 rgData = await reader.getRowGroup(rg);
+            } else if (typeof reader.getRowGroups === 'function') {
+                const groups = await reader.getRowGroups();
+                rgData = groups && groups[rg] ? groups[rg] : null;
             }
         } catch (e) {
             streamingMetrics.recordStreamingEvent('rowgroup_read_error', `Failed to read row group ${rg}`, { error: e.message });

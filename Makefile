@@ -1,7 +1,7 @@
 # Parquet Performance Testing Framework - Makefile
 # Essential commands for setup and testing
 
-.PHONY: help setup test report clean
+.PHONY: help setup test report clean serve
 
 # Default target
 help: ## Show available commands
@@ -42,3 +42,6 @@ clean: ## Clean up temporary files
 
 stop: ## Stop Docker environment
 	cd docker && docker-compose down
+
+serve: ## Serve the visualization directory
+	npx serve scripts/visualization -p 3000
