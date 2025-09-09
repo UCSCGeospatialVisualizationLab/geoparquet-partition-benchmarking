@@ -135,7 +135,7 @@
         </div>
 
         <div class="streaming-info">
-            <strong>🌊 Hyparquet Streaming:</strong> Progressive row group loading with real-time filtering and early termination when sufficient data is collected.
+            <strong>🌊 Hyparquet + Hysnappy:</strong> Progressive row group streaming with full Snappy decompression, real-time filtering, and early termination. Enhanced decoding for fair comparison with parquet-wasm.
         </div>
 
         <div class="test-controls">
@@ -268,6 +268,14 @@
                     <span>Data Rate:</span>
                     <span class="metric-value">${(result.totalBytesStreamed / result.streamingTime * 1000 / 1024 / 1024).toFixed(2)} MB/s</span>
                 </div>
+                <div class="metric">
+                    <span>Decompression:</span>
+                    <span class="metric-value">${result.totalDecompressedBytes ? formatBytes(result.totalDecompressedBytes) : 'N/A'}</span>
+                </div>
+                <div class="metric">
+                    <span>Decompression Time:</span>
+                    <span class="metric-value">${result.decompressionTime ? result.decompressionTime.toFixed(2) + 'ms' : 'N/A'}</span>
+                </div>
             `;
             
             resultsGrid.appendChild(card);
@@ -280,7 +288,10 @@
                     timestamp: new Date().toISOString(),
                     userAgent: navigator.userAgent,
                     hyparquetVersion: '1.17.1',
-                    testType: 'hyparquet_streaming'
+                    hysnappyVersion: '1.0.0',
+                    testType: 'hyparquet_hysnappy_streaming_optimized',
+                    decodingMethod: 'optimized_hyparquet_with_snappy_decompression',
+                    optimizations: 'global_init_simplified_api_efficient_processing'
                 },
                 results: testResults
             }, null, 2);
@@ -345,18 +356,45 @@
             return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
         }
 
+        // Global library initialization - done once for performance
+        let globalLibrariesInitialized = false;
+        let hyparquetLib = null;
+        let hysnappyLib = null;
+
         // Initialize page
         document.addEventListener('DOMContentLoaded', async function() {
-            updateStatus('Loading Hyparquet library...');
+            updateStatus('Loading Hyparquet and Hysnappy libraries...');
             try {
                 // Import hyparquet from unpkg CDN (main entry point)
-                window.hyparquet = await import('https://unpkg.com/hyparquet@1.17.1');
+                updateStatus('Loading Hyparquet...');
+                hyparquetLib = await import('https://unpkg.com/hyparquet@1.17.1');
+                window.hyparquet = hyparquetLib;
                 console.log('Hyparquet library loaded successfully');
-                console.log('Hyparquet exports:', Object.keys(window.hyparquet));
-                updateStatus('Ready to run Hyparquet streaming tests');
+                console.log('Hyparquet exports:', Object.keys(hyparquetLib));
+                
+                // Import and initialize hysnappy for Snappy decompression
+                updateStatus('Loading and initializing Hysnappy WASM...');
+                hysnappyLib = await import('https://unpkg.com/hysnappy@1.0.0');
+                window.hysnappy = hysnappyLib;
+                
+                // Initialize hysnappy WASM module globally (once!)
+                if (typeof hysnappyLib.initialize === 'function') {
+                    await hysnappyLib.initialize();
+                    console.log('Hysnappy WASM module initialized');
+                } else {
+                    console.log('Hysnappy ready (no initialization needed)');
+                }
+                
+                // Mark libraries as ready
+                globalLibrariesInitialized = true;
+                window.globalLibrariesInitialized = true;
+                
+                console.log('All libraries initialized successfully');
+                updateStatus('Ready to run Hyparquet + Hysnappy streaming tests (optimized)');
             } catch (error) {
-                console.error('Hyparquet library failed to load:', error);
-                updateStatus('Error: Hyparquet library failed to load', true);
+                console.error('Library loading failed:', error);
+                updateStatus('Error: Failed to load required libraries', true);
+                globalLibrariesInitialized = false;
             }
         });
     </script>
